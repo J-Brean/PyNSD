@@ -1,0 +1,23 @@
+# Virtual environments
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Data & Media files
+*.csv
+*.xlsx
+*.xls
+*.wav
+
+#deep learning file
+NPF_CNN_model.pkl
+
+# OS generated files
+.DS_Store
+
+# Plots & PMF files
+ML_contour_plots/
+PMF/
