@@ -1,10 +1,12 @@
 from __future__ import annotations
+
 from pathlib import Path
 import pandas as pd
 import numpy as np
 import matplotlib.dates as mdates
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+from scipy.interpolate import interp1d                                           
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QFont, QDragEnterEvent, QDropEvent
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QFileDialog, QFrame, QGroupBox, QHBoxLayout, 
@@ -14,6 +16,101 @@ from gui.file_entry_widget import FileEntryWidget
 from utils.data_loader import (DATE_COLUMN_OPTIONS, DATE_FORMAT_OPTIONS, DEFAULT_DATE_COL, DEFAULT_DATE_FMT, 
                                DataFile, load_pnsd_file, apply_qc_filter, calculate_line_losses, align_bins)
 
+# ─────────────────────────────────────────────────────────────────────────── #
+# Spline Harmonisation Diagnostic Dialog
+# ─────────────────────────────────────────────────────────────────────────── #
+class HarmoniseDialog(QDialog):
+    def __init__(self, valid_res_dict, target_keys, parent=None):
+        super().__init__(parent)
+        self.valid_res_dict = valid_res_dict
+        self.target_keys = target_keys
+        self.setWindowTitle("Harmonise Diameters (Cubic Spline Check)")
+        self.resize(900, 600)
+        
+        layout = QVBoxLayout(self)
+        
+        # --- Settings Row ---
+        ctrl = QHBoxLayout()
+        ctrl.addWidget(QLabel("Target Dataset (Reference Diameters):"))
+        self.combo = QComboBox()
+        self.combo.addItems([Path(p).name for p in self.target_keys])
+        self.combo.currentIndexChanged.connect(self.update_plot)
+        ctrl.addWidget(self.combo)
+        
+        ctrl.addSpacing(20)
+        ctrl.addWidget(QLabel("Out-of-range boundaries:"))
+        self.oor_combo = QComboBox()
+        self.oor_combo.addItems(["Fill with 1.0 (Safe for Log plots)", "Drop Out-of-Bounds Columns"])
+        ctrl.addWidget(self.oor_combo)
+        layout.addLayout(ctrl)
+        
+        # --- Plotting Canvas ---
+        self.fig = Figure(figsize=(8, 5))
+        self.canvas = FigureCanvasQTAgg(self.fig)
+        layout.addWidget(self.canvas)
+        
+        # --- Execution Buttons ---
+        btn_box = QHBoxLayout()
+        self.btn_apply = QPushButton("✨ Apply Harmonisation")
+        self.btn_apply.setStyleSheet("font-weight: bold; background-color: #c4d1ba; padding: 8px;")
+        self.btn_apply.clicked.connect(self.accept)
+        btn_box.addStretch()
+        btn_box.addWidget(self.btn_apply)
+        layout.addLayout(btn_box)
+        
+        self.update_plot()
+        
+    def update_plot(self):
+        """Plots the raw mean PNSD against the spline to visually validate the maths."""
+        target_path = self.target_keys[self.combo.currentIndex()]
+        target_data = self.valid_res_dict[target_path]
+        t_diams = np.array(target_data.diameters)
+        
+        self.fig.clear()
+        ax = self.fig.add_subplot(111)
+        ax.set_xscale('log')
+        ax.set_yscale('log')
+        ax.set_xlabel("Diameter (nm)")
+        ax.set_ylabel("Mean dN/dlogDp")
+        ax.set_title("Spline Interpolation Check (Mean PNSD)")
+        
+        for path in self.target_keys:
+            data = self.valid_res_dict[path]
+            o_diams = np.array(data.diameters)
+            
+            # Strip NaNs for the diagnostic mean plot
+            mean_raw = data.df.mean(skipna=True).values
+            p = ax.plot(o_diams, mean_raw, 'o', alpha=0.6, label=f"{Path(path).name} (Raw)")
+            
+            if path == target_path or np.array_equal(o_diams, t_diams):
+                ax.plot(o_diams, mean_raw, '-', color=p[0].get_color(), lw=2, alpha=0.5, label=f"{Path(path).name} (Target Spline)")
+                continue
+            
+            # Clean the raw mean for a stable 1D spline plot
+            valid_mask = ~np.isnan(mean_raw)
+            if not valid_mask.any(): continue
+            clean_o_diams = o_diams[valid_mask]
+            clean_mean = mean_raw[valid_mask]
+            
+            try:
+                f = interp1d(clean_o_diams, clean_mean, kind='cubic', bounds_error=False, fill_value=np.nan)
+                mean_new = f(t_diams)
+                # Plot the new spline curve over the target bin range
+                ax.plot(t_diams, mean_new, '-', color=p[0].get_color(), lw=2, label=f"{Path(path).name} (Spline)")
+            except Exception as e:
+                print(f"Plot spline failed for {path}: {e}")
+                
+        ax.legend(fontsize=8)
+        self.fig.tight_layout()
+        self.canvas.draw()
+        
+    def get_target_path(self): return self.target_keys[self.combo.currentIndex()]
+    def get_oor_action(self): return "fill" if self.oor_combo.currentIndex() == 0 else "drop"
+
+
+# ─────────────────────────────────────────────────────────────────────────── #
+# Load Panel Main Class
+# ─────────────────────────────────────────────────────────────────────────── #
 class LoadPanel(QWidget):
     data_confirmed = pyqtSignal(dict)
     
@@ -29,13 +126,10 @@ class LoadPanel(QWidget):
         self._build_ui()
         self.setAcceptDrops(True)
 
-    # --- FIX 1 & 2: Robust Information Buttons ---
     def _info_btn(self, text, title="Information"):
-        """Creates a reliable clickable info button for tooltips."""
-        btn = QPushButton("ℹ️")  # <-- Changed to emoji here!
-        btn.setFixedSize(24, 24)   # Made slightly bigger to fit the emoji
+        btn = QPushButton("ℹ️") 
+        btn.setFixedSize(24, 24) 
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        # Removed the orange text color so the OS renders the native blue/grey emoji
         btn.setStyleSheet("border: none; font-size: 16px;") 
         btn.clicked.connect(lambda: QMessageBox.information(self, title, text))
         return btn
@@ -61,14 +155,11 @@ class LoadPanel(QWidget):
         intro_layout.addStretch()
         root.addLayout(intro_layout)
 
-        # --- Settings & Corrections Panel ---
         settings_splitter = QSplitter(Qt.Orientation.Horizontal)
         
-        # Left: Global Import Settings
-        import_box = QGroupBox("Import Settings")
+        import_box = QGroupBox("Import Settings") 
         import_layout = QVBoxLayout(import_box)
         
-        # --- FIX 5: Restored Custom Text Inputs ---
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("Date Col:"))
         row1.addWidget(self._info_btn("The exact name of the column in your CSV containing the timestamp.", "Date Column"))
@@ -86,7 +177,8 @@ class LoadPanel(QWidget):
         row1.addWidget(QLabel("Format:"))
         row1.addWidget(self._info_btn("The structural format of your dates. Use 'Custom...' if none match perfectly.", "Date Format"))
         self._fmt_combo = QComboBox()
-        for disp, _ in DATE_FORMAT_OPTIONS: self._fmt_combo.addItem(disp)
+        sorted_fmts = sorted(DATE_FORMAT_OPTIONS, key=lambda x: 0 if str(x[0]).upper().startswith('Y') else (1 if str(x[0]).upper().startswith('D') else 2)) 
+        for disp, _ in sorted_fmts: self._fmt_combo.addItem(disp) 
         self._fmt_combo.currentIndexChanged.connect(self._on_fmt_changed)
         row1.addWidget(self._fmt_combo)
         
@@ -133,8 +225,7 @@ class LoadPanel(QWidget):
         import_layout.addWidget(apply_btn)
         settings_splitter.addWidget(import_box)
 
-        # Right: Corrections & QC
-        corr_box = QGroupBox("Corrections & QC (Applies to active preview)")
+        corr_box = QGroupBox("Corrections & QC (Applies to active preview)") 
         corr_layout = QVBoxLayout(corr_box)
         
         qc_row = QHBoxLayout()
@@ -160,24 +251,32 @@ class LoadPanel(QWidget):
         qc_row.addWidget(qc_btn)
         corr_layout.addLayout(qc_row)
 
-        thresh_row = QHBoxLayout()                                                                 # Create new layout row
-        thresh_row.addWidget(QLabel("Min Floor:"))                                                 # Label for threshold
-        self._floor_thresh = QLineEdit("1.0")                                                      # Default to 1.0
-        self._floor_thresh.setFixedWidth(40)                                                       # Keep UI tight
-        thresh_row.addWidget(self._floor_thresh)                                                   # Add to layout
+        thresh_row = QHBoxLayout()                                                                                       
+        thresh_row.addWidget(QLabel("Min Floor:"))                                                                       
+        self._floor_thresh = QLineEdit("1.0")                                                                            
+        self._floor_thresh.setFixedWidth(40)                                                                             
+        thresh_row.addWidget(self._floor_thresh)                                                                         
 
-        btn_floor = QPushButton("Apply Floor")                                                     # Create action button
-        btn_floor.clicked.connect(self._run_floor_threshold)                                       # Connect to logic
-        thresh_row.addWidget(btn_floor)                                                            # Add to layout
+        btn_floor = QPushButton("Apply Floor")                                                                           
+        btn_floor.clicked.connect(self._run_floor_threshold)                                                             
+        thresh_row.addWidget(btn_floor)                                                                                  
         
-        floor_info = ("MPSS instruments cannot reliably measure < 1 particle/cm3.\n"               # Define physical context
+        floor_info = ("MPSS instruments cannot reliably measure < 1 particle/cm3.\n"                                     
                       "Values below this are often non-physical. Low values are sometimes also used as error flags.\n"
                       "This tool replaces all values below your threshold with the threshold.")
-        thresh_row.addWidget(self._info_btn(floor_info, "Minimum Floor Threshold"))                # Add info button
-        thresh_row.addStretch()                                                                    # Push elements left
-        corr_layout.addLayout(thresh_row)                                                          # Add to main corrections box
+        thresh_row.addWidget(self._info_btn(floor_info, "Minimum Floor Threshold"))                                      
+
+        thresh_row.addWidget(QLabel("Max Ceiling:")) 
+        self._ceil_thresh = QLineEdit("1e6") 
+        self._ceil_thresh.setFixedWidth(40) 
+        thresh_row.addWidget(self._ceil_thresh) 
         
-        ll_row = QHBoxLayout()
+        btn_ceil = QPushButton("Apply Ceiling") 
+        btn_ceil.clicked.connect(self._run_ceil_threshold) 
+        thresh_row.addWidget(btn_ceil) 
+        
+        thresh_row.addStretch()                                                                                          
+        corr_layout.addLayout(thresh_row)                                                                                
         
         ll_row = QHBoxLayout()
         ll_row.addWidget(QLabel("L(m):"))
@@ -222,8 +321,7 @@ class LoadPanel(QWidget):
         settings_splitter.addWidget(corr_box)
         root.addWidget(settings_splitter)
 
-        # --- File Lists & Preview ---
-        file_row = QHBoxLayout()
+        file_row = QHBoxLayout() 
         add_btn = QPushButton("+ Add files…")
         add_btn.clicked.connect(self._browse_files)
         file_row.addWidget(add_btn)
@@ -251,12 +349,11 @@ class LoadPanel(QWidget):
         preview_layout.addWidget(self._preview_table)
         list_splitter.addWidget(preview_container)
         
-        list_splitter.setSizes([600, 200])   # Forces top to start at 600px and bottom at 200px
-        list_splitter.setStretchFactor(0, 1) # If window grows, give all extra space to the file list
-        list_splitter.setStretchFactor(1, 0) # Tell the preview table NOT to grow
+        list_splitter.setSizes([600, 200])   
+        list_splitter.setStretchFactor(0, 1) 
+        list_splitter.setStretchFactor(1, 0) 
         root.addWidget(list_splitter, stretch=1)
-        # --- Action Row ---
-        action_row = QHBoxLayout()
+        action_row = QHBoxLayout() 
         
         self.merge_append_btn = QPushButton("Simple Append (Keep Bins)")
         self.merge_append_btn.setStyleSheet("font-weight: bold; background-color: #e2d5cb;")
@@ -270,7 +367,14 @@ class LoadPanel(QWidget):
         self.merge_splice_btn.setEnabled(False)
         self.merge_splice_btn.clicked.connect(lambda: self._execute_merge(mode="splice"))
         action_row.addWidget(self.merge_splice_btn)
-        action_row.addWidget(self._info_btn("Joins two datasets with overlapping times, but different bins. Used to, for example, merge NanoSMPS and LongSMPS data. The spline feature will give the datasets a consistent set of diameters with consistent dlogdp values (note: check that this maintains total N!).", "Splice Datasets"))
+        action_row.addWidget(self._info_btn("Joins two datasets with overlapping times, but different bins. Used to, for example, merge NanoSMPS and LongSMPS data.", "Splice Datasets"))
+        
+        self.harmonise_btn = QPushButton("Harmonise Dp") 
+        self.harmonise_btn.setStyleSheet("font-weight: bold; background-color: #c4d1ba;") 
+        self.harmonise_btn.setEnabled(False) 
+        self.harmonise_btn.clicked.connect(self._run_harmonise) 
+        action_row.addWidget(self.harmonise_btn) 
+        action_row.addWidget(self._info_btn("Interpolates selected datasets onto a common set of diameters via cubic splines.", "Harmonise Dp")) 
         
         save_btn = QPushButton("Export Active Preview to CSV")
         save_btn.clicked.connect(self._export_csv)
@@ -278,7 +382,7 @@ class LoadPanel(QWidget):
         action_row.addStretch()
         
         self._confirm_btn = QPushButton("📊 Proceed with selected dataframe  →")
-        self._confirm_btn.setStyleSheet("font-size: 16pt; font-weight: bold;") # Sets size and boldness
+        self._confirm_btn.setStyleSheet("font-size: 16pt; font-weight: bold;") 
         self._confirm_btn.clicked.connect(self._confirm)
         action_row.addWidget(self._confirm_btn)
         root.addLayout(action_row)
@@ -287,18 +391,16 @@ class LoadPanel(QWidget):
         self.progress_bar.setVisible(False)
         root.addWidget(self.progress_bar)
 
-    # --- UI Events for Custom Fields ---
     def _on_col_changed(self, text):
         self._custom_col.setVisible(text == "Custom...")
         
     def _on_fmt_changed(self, idx):
-        _, val = DATE_FORMAT_OPTIONS[idx]
+        disp = self._fmt_combo.itemText(idx) 
+        val = next(v for d, v in DATE_FORMAT_OPTIONS if d == disp) 
         self._custom_fmt.setVisible(val == "custom")
 
-    # --- Loading & UI Handling ---
-
     def _browse_files(self):
-        paths, _ = QFileDialog.getOpenFileNames(self, "Select PNSD files", "", "Data (*.csv *.xlsx *.xls)")
+        paths, _ = QFileDialog.getOpenFileNames(self, "Select PNSD files", "", "Data (*.csv *.xlsx *.xls *.txt *.dat *.tsv)")
         if not paths: return
         
         self.progress_bar.setVisible(True)
@@ -312,15 +414,48 @@ class LoadPanel(QWidget):
 
     def _inject_file_to_list(self, path: str):
         if path not in self._entries:
-            entry = FileEntryWidget(path)
-            entry.removed.connect(self._remove_file)
-            entry.selected.connect(self._select_file)
+            entry = FileEntryWidget(path)                                                # Create widget
+            entry.removed.connect(self._remove_file)                                     # Bind removal
+            entry.selected.connect(self._select_file)                                    # Bind selection
+            entry.reparse_requested.connect(lambda p=path: self._parse_and_update(p))    # Bind reparse
             
-            # FIX: Use a lambda to explicitly pass the path to the reparse function
-            entry.reparse_requested.connect(lambda p=path: self._parse_and_update(p)) 
+            row_widget = QWidget()                                                       # Create wrapper
+            row_layout = QHBoxLayout(row_widget)                                         # Add layout
+            row_layout.setContentsMargins(0, 0, 0, 0)                                    # Strip margins
             
-            self._entries[path] = entry
-            self._file_list_layout.insertWidget(self._file_list_layout.count()-1, entry)
+            info_icon = QLabel("📄")                                                     # Create icon
+            info_icon.setFixedSize(24, 24)                                               # Size icon
+            info_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)                         # Centre icon
+            info_icon.setStyleSheet("background-color: #d1c4ba; border-radius: 4px;")    # Style icon
+            info_icon.setCursor(Qt.CursorShape.PointingHandCursor)                       # Add pointer cursor
+            
+            preview_text = "Preview not available for this file type."                   # Fallback text
+            try:
+                if path.lower().endswith(('.csv', '.txt', '.dat', '.tsv')):              # Check format
+                    with open(path, 'r', encoding='utf-8', errors='replace') as f:       # Open safely
+                        lines = []                                                       # Init storage
+                        for _ in range(7):                                               # Grab 7 lines
+                            try:
+                                line = next(f).strip()                                   # Read line
+                                line = line.replace('<', '&lt;').replace('>', '&gt;')    # Stop HTML rendering bugs!
+                                lines.append(line[:80] + "..." if len(line) > 80 else line) # Trim length
+                            except StopIteration: break                                  # End of file
+                        if lines:
+                            preview_text = "RAW FILE PREVIEW:\n" + "\n".join(lines)      # Join lines
+                        else:
+                            preview_text = "File is empty."                              # Empty flag
+            except Exception as e: 
+                preview_text = f"Could not read file preview.\nError: {e}"               # Catch lock errors
+                
+            info_icon.setToolTip(preview_text)                                           # Force tooltip to icon
+            
+            row_layout.addWidget(info_icon)                                              # Pack icon
+            row_layout.addWidget(entry)                                                  # Pack entry
+            
+            self._entries[path] = entry                                                  # Store reference
+            entry._container = row_widget                                                # Link wrapper
+            
+            self._file_list_layout.insertWidget(self._file_list_layout.count()-1, row_widget) # Add to UI
             
     def _parse_and_update(self, path: str):
         entry = self._entries.get(path)
@@ -330,10 +465,10 @@ class LoadPanel(QWidget):
             if path in self._results: entry.set_result(self._results[path])
             return
         
-        # 1. Read Global Settings
         g_col_text = self._col_combo.currentText()
         g_col = self._custom_col.text() if g_col_text == "Custom..." else g_col_text
-        g_fmt_val = DATE_FORMAT_OPTIONS[self._fmt_combo.currentIndex()][1]
+        g_fmt_disp = self._fmt_combo.currentText() 
+        g_fmt_val = next(v for d, v in DATE_FORMAT_OPTIONS if d == g_fmt_disp) 
         g_fmt = self._custom_fmt.text() if g_fmt_val == "custom" else g_fmt_val
         g_tz = self._tz_input.text()
         g_drop = self._drop_cols.text()
@@ -341,7 +476,6 @@ class LoadPanel(QWidget):
         g_res_val = self._resample_val.text().strip()
         g_res_unit = self._resample_unit.currentText()
         
-        # 2. Ask file entry for its effective settings (Overrides win)
         col = entry.effective_col(g_col)
         fmt = entry.effective_fmt(g_fmt)
         tz = entry.effective_tz(g_tz)
@@ -349,7 +483,6 @@ class LoadPanel(QWidget):
         na_text = entry.effective_na(g_na)
         res_val, res_unit = entry.effective_resample(g_res_val, g_res_unit)
         
-        # 3. Process the logic
         na_map = {"Drop Rows": "drop", "Fill (Fwd/Bwd)": "ffill", "Interpolate": "interpolate", "Fill Min (1e0)": "zero"}
         na_method = na_map.get(na_text, "drop")
         
@@ -403,7 +536,9 @@ class LoadPanel(QWidget):
 
     def _remove_file(self, path: str):
         entry = self._entries.pop(path, None)
-        if entry: entry.deleteLater()
+        if entry: 
+            if hasattr(entry, '_container'): entry._container.deleteLater()
+            else: entry.deleteLater()
         self._results.pop(path, None)
         if path in self._selected_paths: self._selected_paths.remove(path)
         if self._active_preview_path == path: 
@@ -415,25 +550,36 @@ class LoadPanel(QWidget):
         for path in list(self._entries): self._remove_file(path)
         self._selected_paths.clear()
 
-    # --- Corrections & Splicing ---
-
     def _run_floor_threshold(self):
-        df, diams = self._get_active_data()                                                        # Fetch active dataset
-        if df is None: return                                                                      # Escape if empty
+        df, diams = self._get_active_data()                                                                              
+        if df is None: return                                                                                            
+        try: threshold = float(self._floor_thresh.text())                                                                
+        except ValueError: return                                                                                        
         
-        try: threshold = float(self._floor_thresh.text())                                          # Parse user input
-        except ValueError: return                                                                  # Ignore text/typos
+        num_replaced = (df < threshold).sum().sum()                                                                      
+        df_floored = df.clip(lower=threshold)                                                                            
         
-        num_replaced = (df < threshold).sum().sum()                                                # Count values below threshold before modifying
-        
-        df_floored = df.clip(lower=threshold)                                                      # Pandas replaces all values below threshold
-        
-        if self._active_preview_path == "MERGED": self._merged_df = df_floored                     # Save to merged state
-        else: self._results[self._active_preview_path].df = df_floored                             # Save to individual file state
+        if self._active_preview_path == "MERGED": self._merged_df = df_floored                                           
+        else: self._results[self._active_preview_path].df = df_floored                                                   
             
-        self._populate_preview(df_floored, diams, f"Values < {threshold} floored")                 # Update GUI table
-        QMessageBox.information(self, "Sorted!", f"Successfully replaced {num_replaced} values that were below {threshold}. 🧹") # Success pop-up
+        self._populate_preview(df_floored, diams, f"Values < {threshold} floored")                                       
+        QMessageBox.information(self, "Sorted!", f"Successfully replaced {num_replaced} values that were below {threshold}. 🧹") 
+
+    def _run_ceil_threshold(self): 
+        df, diams = self._get_active_data() 
+        if df is None: return 
+        try: threshold = float(self._ceil_thresh.text()) 
+        except ValueError: return 
         
+        num_replaced = (df > threshold).sum().sum() 
+        df_ceiled = df.clip(upper=threshold) 
+        
+        if self._active_preview_path == "MERGED": self._merged_df = df_ceiled 
+        else: self._results[self._active_preview_path].df = df_ceiled 
+        
+        self._populate_preview(df_ceiled, diams, f"Values > {threshold} ceiling applied") 
+        QMessageBox.information(self, "Sorted!", f"Successfully replaced {num_replaced} values that were above {threshold}. 🧹") 
+
     def _update_merge_buttons(self):
         valid_total = sum(1 for r in self._results.values() if r.ok)
         if len(self._selected_paths) > 0:
@@ -443,6 +589,73 @@ class LoadPanel(QWidget):
             can_merge = valid_total >= 2
         self.merge_append_btn.setEnabled(can_merge)
         self.merge_splice_btn.setEnabled(can_merge)
+        self.harmonise_btn.setEnabled(can_merge) 
+
+    def _run_harmonise(self): 
+        """Harmonises datasets onto a common target bin set using cubic splines."""
+        target_keys = [p for p in self._results if p in self._selected_paths] if len(self._selected_paths) >= 2 else list(self._results.keys()) 
+        valid_res_keys = [k for k in target_keys if self._results[k].ok] 
+        if len(valid_res_keys) < 2: return 
+        
+        dlg = HarmoniseDialog(self._results, valid_res_keys, self)
+        
+        if dlg.exec():
+            target_path = dlg.get_target_path()
+            oor_action = dlg.get_oor_action()
+            target_data = self._results[target_path]
+            t_diams = np.array(target_data.diameters)
+            
+            harmonised_dfs = {}
+            
+            for path in valid_res_keys:
+                if path == target_path:
+                    harmonised_dfs[path] = self._results[path].df.copy()
+                    continue
+                
+                data = self._results[path]
+                o_diams = np.array(data.diameters)
+                if np.array_equal(o_diams, t_diams):
+                    harmonised_dfs[path] = data.df.copy()
+                    continue
+                
+                # Math safe interpolation strictly for the spline application
+                df_clean = data.df.interpolate(method='linear', axis=1, limit_direction='both').fillna(1e-4)
+                try:
+                    f = interp1d(o_diams, df_clean.values, axis=1, kind='cubic', bounds_error=False, fill_value=np.nan)
+                    new_vals = f(t_diams)
+                    harmonised_dfs[path] = pd.DataFrame(new_vals, index=data.df.index, columns=t_diams)
+                except Exception as e:
+                    QMessageBox.warning(self, "Spline Error", f"Failed to harmonise {Path(path).name}:\n{e}")
+                    harmonised_dfs[path] = None
+
+            # --- Out of Range (OOR) Handler ---
+            if oor_action == "drop":
+                valid_cols = pd.Series(True, index=t_diams)
+                for df in harmonised_dfs.values():
+                    if df is not None:
+                        valid_cols = valid_cols & df.notna().any()
+                
+                t_diams = t_diams[valid_cols]
+                for path in harmonised_dfs:
+                    if harmonised_dfs[path] is not None:
+                        harmonised_dfs[path] = harmonised_dfs[path].loc[:, t_diams]
+            else:
+                for path in harmonised_dfs:
+                    if harmonised_dfs[path] is not None:
+                        harmonised_dfs[path] = harmonised_dfs[path].fillna(1.0).clip(lower=1e-4)
+
+            # Apply final assignments back to standard workflow
+            for path in valid_res_keys:
+                if harmonised_dfs[path] is not None:
+                    self._results[path].df = harmonised_dfs[path]
+                    self._results[path].diameters = list(t_diams)
+                    self._results[path].n_bins = len(t_diams)
+                    
+            self._update_merge_buttons()
+            if self._active_preview_path in valid_res_keys:
+                self._populate_preview(self._results[self._active_preview_path].df, list(t_diams), "Harmonised")
+            
+            QMessageBox.information(self, "Success", "Datasets harmonised successfully! 📏")
 
     def _get_active_data(self):
         if self._active_preview_path == "MERGED": return self._merged_df, self._merged_diams
@@ -574,7 +787,6 @@ class LoadPanel(QWidget):
         name, ok = QInputDialog.getText(self, "Name Dataset", "Enter a name for the combined dataset:")
         if not ok or not name: return
         
-        # Dynamic import to avoid circular dependency
         if mode == "splice":
             from gui.merger_dialogue import InstrumentMergerDialog
             if len(valid_res) == 2:
@@ -609,7 +821,7 @@ class LoadPanel(QWidget):
         self._results[fake_path] = new_data
         self._inject_file_to_list(fake_path)
         
-        self._entries[fake_path].set_result(new_data)                        # Tell the UI row it's finished!
+        self._entries[fake_path].set_result(new_data)                        
         
         self._selected_paths = {fake_path}
         for p, entry in self._entries.items(): entry.set_selected_style(p == fake_path)
@@ -617,6 +829,7 @@ class LoadPanel(QWidget):
         self._update_dlogdp_box(list(final_diams))
         self._populate_preview(merged_df, list(final_diams), f"Previewing: {fake_path}")
         self._update_merge_buttons()
+        
     def _export_csv(self):
         df, _ = self._get_active_data()
         if df is None: return
@@ -646,10 +859,8 @@ class LoadPanel(QWidget):
         self._preview_table.resizeColumnsToContents()
 
     def _confirm(self):
-        # 1. Grab only the files that are currently highlighted (Ctrl-clicked)
         target_keys = [p for p in self._results if p in self._selected_paths]
         
-        # 2. Fallbacks: If nothing is highlighted, try the active preview, or auto-select if there's only 1 file
         if not target_keys:
             if self._active_preview_path:
                 target_keys = [self._active_preview_path]
@@ -659,7 +870,6 @@ class LoadPanel(QWidget):
                 QMessageBox.warning(self, "No Selection", "Please click on a file in the list to select it before continuing.")
                 return
 
-        # 3. Filter for valid files and emit them to the main application
         ok_res = {p: self._results[p] for p in target_keys if self._results.get(p) and self._results[p].ok}
         
         if ok_res: 
