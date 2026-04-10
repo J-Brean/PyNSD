@@ -1015,6 +1015,9 @@ class PMFPanel(QWidget):
         archive_dir = os.path.join(self.working_dir, "saved_library", name)
         os.makedirs(archive_dir, exist_ok=True)
         
+        # Convert DatetimeIndex to string list for JSON storage
+        ts_list = self.g_matrix.index.strftime('%Y-%m-%d %H:%M:%S').tolist()            # Capture timestamps
+
         try:
             fpeak_str = self.combo_fpeak.currentText().split("FPEAK:")[1].split(",")[0].strip()
         except:
@@ -1024,8 +1027,8 @@ class PMFPanel(QWidget):
         g_src = os.path.join(self.run_dir, f"G_FACTOR_{self.current_factors}_{fpeak_str}.TXT")
         
         try:
-            shutil.copy(f_src, os.path.join(archive_dir, "F_MATRIX.TXT"))
-            shutil.copy(g_src, os.path.join(archive_dir, "G_MATRIX.TXT"))
+            shutil.copy(f_src, os.path.join(archive_dir, "F_MATRIX.TXT"))               # Copy profile matrix
+            shutil.copy(g_src, os.path.join(archive_dir, "G_MATRIX.TXT"))               # Copy contribution matrix
             
             import json
             meta = {
@@ -1033,58 +1036,53 @@ class PMFPanel(QWidget):
                 "fpeak": self.current_fpeak, 
                 "names": self.factor_names, 
                 "chk_wide": self.chk_wide_pmf.isChecked(),
-                "diams": list(self.diams) if self.diams is not None else [] # Save the specific bins used
+                "diams": list(self.diams) if self.diams is not None else [],            # Save bins
+                "timestamps": ts_list                                                   # Save dates!
             }
             with open(os.path.join(archive_dir, "metadata.json"), 'w') as f:
-                json.dump(meta, f)
-            QMessageBox.information(self, "Success", f"Model archived to saved_library/{name}")
+                json.dump(meta, f)                                                      # Write metadata
+            QMessageBox.information(self, "Success", f"Model archived with timestamps to saved_library/{name}")
         except Exception as e:
-            QMessageBox.critical(self, "Save Error", f"Could not find files to copy: {e}")
+            QMessageBox.critical(self, "Save Error", f"Could not archive model: {e}")
 
     def load_from_library(self):
-        library_root = os.path.join(self.working_dir, "saved_library")                   # Define library path
+        library_root = os.path.join(self.working_dir, "saved_library")
         selected_dir = QFileDialog.getExistingDirectory(self, "Select Archived Model", library_root)
-        if not selected_dir: return                                                      # Exit if cancelled
+        if not selected_dir: return
         
         try:
-            import json                                                                  # For meta parsing
+            import json
             with open(os.path.join(selected_dir, "metadata.json"), 'r') as f:
-                meta = json.load(f)                                                      # Unpack save info
+                meta = json.load(f)                                                     # Load saved settings
             
-            # 1. Restore Metadata & WidePMF State
-            self.current_factors = meta.get("factors", 0)                                # Set factors
-            self.current_fpeak = meta.get("fpeak", 0.0)                                  # Set fpeak
-            self.factor_names = meta.get("names", {})                                    # Restore factor names
-            self.chk_wide_pmf.setChecked(meta.get("chk_wide", False))                    # Flip WidePMF toggle
-            self.diams = np.array(meta.get("diams", []))                                 # Restore core diameters
+            # 1. Restore UI State, Bins, and Timestamps
+            self.current_factors = meta.get("factors", 0)
+            self.current_fpeak = meta.get("fpeak", 0.0)
+            self.factor_names = meta.get("names", {})
+            self.chk_wide_pmf.setChecked(meta.get("chk_wide", False))
+            self.diams = np.array(meta.get("diams", []))                                # Restore diameter bins
+            
+            ts_list = meta.get("timestamps", [])
+            if ts_list:
+                self.dates = pd.to_datetime(ts_list)                                    # Restore datetime index
             
             # 2. Load Matrices
             f_vals = np.array(open(os.path.join(selected_dir, "F_MATRIX.TXT")).read().replace(',', ' ').split(), dtype=float)
             g_vals = np.array(open(os.path.join(selected_dir, "G_MATRIX.TXT")).read().replace(',', ' ').split(), dtype=float)
             
-            self.f_matrix = pd.DataFrame(f_vals.reshape(self.current_factors, -1).T)     # Rebuild F DataFrame
-            self.g_matrix = pd.DataFrame(g_vals.reshape(-1, self.current_factors))       # Rebuild G DataFrame
+            self.f_matrix = pd.DataFrame(f_vals.reshape(self.current_factors, -1).T)
+            self.g_matrix = pd.DataFrame(g_vals.reshape(-1, self.current_factors))
             
-            # 3. Handle Indexing (The "Hours" Logic)
-            if len(self.diams) > 0:
-                if not self.chk_wide_pmf.isChecked():                                    # Standard PMF Mode
-                    if len(self.f_matrix) == len(self.diams):
-                        self.f_matrix.index = self.diams                                 # Direct diameter mapping
-                else:
-                    # WidePMF Mode: We leave the index as 0, 1, 2... 
-                    # The Visualiser will calculate: Hours = Total Columns / len(diams)
-                    print(f"DEBUG: WidePMF loaded. Profile length: {len(self.f_matrix)}")
+            # 3. Apply Restored Indices
+            if len(self.diams) > 0 and not self.chk_wide_pmf.isChecked():
+                if len(self.f_matrix) == len(self.diams):
+                    self.f_matrix.index = self.diams                                    # Apply diams to F
             
-            # 4. Restore Timestamps
-            if self.dates is not None:                                                   # Check if dates available
-                if len(self.g_matrix) == len(self.dates):
-                    self.g_matrix.index = self.dates                                     # Map to loaded timestamps
-                else:
-                    self.g_matrix.index = pd.date_range(self.dates.min(), periods=len(self.g_matrix), freq='D')
+            if self.dates is not None and len(self.g_matrix) == len(self.dates):
+                self.g_matrix.index = self.dates                                        # Apply dates to G
             
             self.lbl_fpeak.setText(f"Active Data (LIBRARY): {os.path.basename(selected_dir)}")
-            QMessageBox.information(self, "Loaded", f"Archived {'WidePMF' if meta.get('chk_wide') else 'Standard'} model restored.")
+            QMessageBox.information(self, "Loaded", "Model restored with full temporal and diameter data.")
             
         except Exception as e:
-            QMessageBox.critical(self, "Load Error", f"Failed to reconstruct archived model:\n{e}")
-    
+            QMessageBox.critical(self, "Load Error", f"Failed to reconstruct model: {e}")
