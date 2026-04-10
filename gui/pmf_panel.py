@@ -10,15 +10,16 @@ import matplotlib as mpl                                                 # Globa
 import seaborn as sns                                                    # Global Seaborn import
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg         # Embedded plotting for Qt
 from matplotlib.figure import Figure                                     # Figure object 
-from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,          # Core UI layouts
-                             QPushButton, QFileDialog, QLabel,           # Core UI elements
-                             QLineEdit, QComboBox, QDoubleSpinBox,       # Inputs
-                             QSlider, QGroupBox, QGridLayout,            # Advanced UI
-                             QMessageBox, QTableWidget, QSpinBox,        # Dialogues and tables
-                             QTableWidgetItem, QDialog, QProgressBar,    # Dialogues and bars
-                             QApplication, QCheckBox, QTabWidget)        # App control and tabs
-from PyQt6.QtCore import Qt, QSettings                                   # For alignment flags and memory
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, 
+                             QPushButton, QFileDialog, QLabel, 
+                             QLineEdit, QComboBox, QDoubleSpinBox, 
+                             QSlider, QGroupBox, QGridLayout, 
+                             QMessageBox, QTableWidget, QSpinBox, 
+                             QTableWidgetItem, QDialog, QProgressBar, 
+                             QApplication, QCheckBox, QTabWidget,
+                             QInputDialog) 
 from PyQt6.QtGui import QFont                                            # For monospace fonts
+from PyQt6.QtCore import Qt, QSettings  # Added QSettings back to the import list
 from utils.pmf_ini_generator import generate_pmf_ini                     # External INI generator
 
 class CowProgressDialog(QDialog):
@@ -129,7 +130,8 @@ class TabbedVisualizer(QDialog):
         self._build_size_tab()                                           
         self._build_time_tab()                                           
         self._build_seasonal_tab()                                       
-        self._build_dow_tab()                                            
+        self._build_dow_tab()    
+        self._build_diurnal_tab()                                                                                   
         self._build_mass_tab()                                           
         self._build_resid_recon_tab()                                    
         self._build_diag_tab()                                           
@@ -231,6 +233,38 @@ class TabbedVisualizer(QDialog):
             ax.fill_between(range(7), mu[c]-se[c], mu[c]+se[c], color=l.get_color(), alpha=0.2)
         ax.set_xticks(range(7)); ax.set_xticklabels(days, rotation=45); ax.set_ylabel(r'Particle Number (cm$^{-3}$)')
         ax.legend(); fig.tight_layout(); layout.addWidget(canvas); self.tabs.addTab(tab, "Day of Week")
+
+    def _build_diurnal_tab(self):
+        tab = QWidget(); layout = QVBoxLayout(tab)
+        fig = Figure(figsize=(8, 6)); canvas = FigureCanvasQTAgg(fig)
+        ax = fig.add_subplot(111)
+
+        diams = self.panel.diams
+        dlogdp = np.log10(diams[1] / diams[0]) if len(diams) > 1 else 1.0
+
+        for i in range(self.panel.current_factors):
+            name = self.panel._get_factor_name(i)
+            try:
+                if self.panel.chk_wide_pmf.isChecked():
+                    n_bins = len(diams); n_hours = len(self.panel.f_matrix) // n_bins
+                    f_reshaped = self.panel.f_matrix.iloc[:, i].values.reshape(n_hours, n_bins)
+                    y_vals = (np.sum(f_reshaped, axis=1) * dlogdp) * self.panel.g_matrix.iloc[:, i].mean()
+                    ax.plot(np.arange(n_hours), y_vals, label=name, lw=2, marker='o')
+                else:
+                    df = self.g_number.iloc[:, i].copy()
+                    if not isinstance(df.index, pd.DatetimeIndex):               # Ensure index is datetime
+                        df.index = pd.to_datetime(df.index)                      # Convert if needed
+                    diurnal = df.groupby(df.index.hour).mean()                   # Compute diurnal mean
+                    ax.plot(diurnal.index, diurnal.values, label=name, lw=2, marker='o')
+            except Exception as e: print(f"Diurnal plot fail: {e}")              # Prevent tab crash
+
+        ax.set_xlabel("Hour of Day", fontsize=14)
+        ax.set_ylabel("Mean Particle Number (cm-3)", fontsize=14)
+        ax.set_xticks(np.arange(0, 24, 2))                                       # Set logical hour ticks
+        ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left'); ax.grid(True, ls="--", alpha=0.4)
+        fig.tight_layout(); layout.addWidget(canvas)
+        self._add_save_button(layout, fig, "Diurnal_Cycle.png")
+        self.tabs.addTab(tab, "Diurnal Cycle")
 
     def _build_mass_tab(self):
         tab = QWidget(); layout = QVBoxLayout(tab); fig = Figure(figsize=(8, 6)); canvas = FigureCanvasQTAgg(fig); ax = fig.add_subplot(111)
@@ -424,6 +458,7 @@ class PMFPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)                                         
         
+        self.batch_diams = None
         self.df = None                                                   
         self.dates = None                                                
         self.diams = None                                                
@@ -447,7 +482,12 @@ class PMFPanel(QWidget):
         self.df = data_file.df.copy()                                    
         self.df.index = pd.to_datetime(self.df.index)                    
         self.dates = self.df.index                                       
-        self.diams = np.array(data_file.diameters)                       
+        self.diams = np.array(data_file.diameters)
+
+        self.combo_fpeak.clear()                                                 
+        self.f_matrix = None
+        self.g_matrix = None
+        self.batch_diams = None                       
     
     def prepare_run_directory(self):
         if not self.run_dir: return                                      
@@ -641,23 +681,31 @@ class PMFPanel(QWidget):
         sel_layout.addWidget(self.lbl_fpeak); sel_layout.addWidget(self.combo_fpeak)
         explore_layout.addLayout(sel_layout)                             
         
-        action_layout = QHBoxLayout()                                    
-        btn_vis = QPushButton("1. Open Visualisation Suite")             
-        btn_vis.setStyleSheet("background-color: #9C27B0; color: white;")
-        btn_vis.setToolTip("Step 8a: Inspect the selected array across dynamic plotting metrics.")
-        btn_vis.clicked.connect(self.open_visualiser); action_layout.addWidget(btn_vis)
+        action_layout = QHBoxLayout()                                            # Container
+        btn_vis = QPushButton("1. Open Visualisation Suite")                     # Button 1
+        btn_vis.clicked.connect(self.open_visualiser)                            # Link
+        btn_opt = QPushButton("2. Optimise Error Fraction")                     # Button 2
+        btn_opt.clicked.connect(self.optimize_coefficients)                      # Link
+        btn_rename = QPushButton("3. Rename Factors")                            # Button 3
+        btn_rename.clicked.connect(self.open_renamer)                            # Link
         
-        btn_opt = QPushButton("2. Optimise Error Fraction (Q/Qexp ≈ 1)") 
-        btn_opt.setStyleSheet("background-color: #2196F3; color: white;")
-        btn_opt.setToolTip("Step 8b: Select an ideal factor count, then iteratively drive its Q/Qexp toward unity.")
-        btn_opt.clicked.connect(self.optimize_coefficients); action_layout.addWidget(btn_opt)
+        btn_archive = QPushButton("4. Archive to Library")                       # New Archive Button
+        btn_archive.setStyleSheet("background-color: #009688; color: white;")    # Teal style
+        btn_archive.clicked.connect(self.save_current_model)                     # Link logic
+
+        btn_load_lib = QPushButton("5. Load from Library")                       # New Load Button
+        btn_load_lib.setStyleSheet("background-color: #795548; color: white;")   # Brown style
+        btn_load_lib.clicked.connect(self.load_from_library)                     # Link logic
         
-        btn_rename = QPushButton("3. Rename Factors")                    
-        btn_rename.setStyleSheet("background-color: #FF9800; color: white;")
-        btn_rename.setToolTip("Step 8c: Assign final physical source nomenclature to factors.")
-        btn_rename.clicked.connect(self.open_renamer); action_layout.addWidget(btn_rename)
+        for b in [btn_vis, btn_opt, btn_rename, btn_archive, btn_load_lib]: 
+            action_layout.addWidget(b)                                           # Add all to layout        
+        action_layout.addWidget(btn_vis)                                                 # Existing
+        action_layout.addWidget(btn_opt)                                                 # Existing
+        action_layout.addWidget(btn_rename)                                              # Existing
+        action_layout.addWidget(btn_archive)                                             # Existing
+        action_layout.addWidget(btn_load_lib)                                            # Add new button
         
-        explore_layout.addLayout(action_layout)                          
+        explore_layout.addLayout(action_layout)                                          # Pack layout                          
         
         btn_export = QPushButton("4. Export Final Array to CSV")         
         btn_export.setStyleSheet("background-color: #607D8B; color: white;")
@@ -740,6 +788,7 @@ class PMFPanel(QWidget):
         file_path, _ = QFileDialog.getOpenFileName(self, "Select pmf2.exe", "", "Executables (*.exe)") 
         if file_path:                                                    
             self.pmf_exe_path = file_path                                
+            self.working_dir = os.path.dirname(file_path)                        
             self.settings.setValue("exe_path", file_path)                
             self.working_dir = os.path.dirname(file_path)                
             self.run_dir = os.path.join(self.working_dir, "latest_output") 
@@ -762,7 +811,8 @@ class PMFPanel(QWidget):
         if not self.pmf_exe_path or not self.pmf_key_path:               
             QMessageBox.warning(self, "Error", "Please locate both pmf2.exe and pmf2key.key before running.") 
             return
-            
+        
+        self.batch_diams = self.diams.copy()
         self.prepare_run_directory()                                     
             
         fac_min = self.spin_fac_min.value()                              
@@ -817,6 +867,10 @@ class PMFPanel(QWidget):
                     return
                 current_step += 1                                        
                 
+        if self.combo_fpeak.count() > 0:
+            self.combo_fpeak.setCurrentIndex(0)                                  # Trigger update_fpeak
+            self.update_fpeak(self.combo_fpeak.currentText())                   # Double-check trigger
+        
         dialog.update_progress(total_runs, "Complete", "")               
         dialog.close()                                                   
         QMessageBox.information(self, "Success", "Batch PMF runs complete!")
@@ -888,23 +942,25 @@ class PMFPanel(QWidget):
                 os.rename(src, dst)                                      
 
     def update_fpeak(self, text):
-        if text:                                                         
-            f_match = re.search(r"Factors:\s*(\d+)", text)
-            p_match = re.search(r"FPEAK:\s*([-0-9.]+)", text)
+        if text:                                                                 # Check if text exists
+            f_match = re.search(r"Factors:?\s*(\d+)", text, re.IGNORECASE)       # Regex for factor count
+            p_match = re.search(r"FPEAK:?\s*([-0-9.]+)", text, re.IGNORECASE)    # Regex for fpeak value
             
             if f_match and p_match:
-                self.current_factors = int(f_match.group(1))             
-                self.current_fpeak = float(p_match.group(1))             
-                self.lbl_fpeak.setText(f"Active Data: {text}")           
+                self.current_factors = int(f_match.group(1))                     # Extract factors
+                fpeak_str = p_match.group(1)                                     # KEEP STRING for filename match
+                self.current_fpeak = float(fpeak_str)                            # Convert to float for logic
+                self.lbl_fpeak.setText(f"Active Data: {text}")                   # Update the UI label
                 
-                self.factor_names.clear()                                
+                self.factor_names.clear()                                        # Wipe custom names
                 
-                f_path = os.path.join(self.run_dir, f"F_FACTOR_{self.current_factors}_{self.current_fpeak}.TXT")
-                g_path = os.path.join(self.run_dir, f"G_FACTOR_{self.current_factors}_{self.current_fpeak}.TXT")
+                # Path construction using the string '0.0' to match the disk exactly
+                f_path = os.path.join(self.run_dir, f"F_FACTOR_{self.current_factors}_{fpeak_str}.TXT")
+                g_path = os.path.join(self.run_dir, f"G_FACTOR_{self.current_factors}_{fpeak_str}.TXT")
                 
                 try:
                     if not os.path.exists(f_path) or not os.path.exists(g_path): 
-                        raise FileNotFoundError(f"Cannot find:\n{f_path}\n{g_path}") 
+                        raise FileNotFoundError(f"File mismatch! Looking for: {f_path}") 
                     
                     with open(f_path, 'r') as f:
                         f_vals = np.array(f.read().replace(',', ' ').split(), dtype=float)
@@ -915,33 +971,120 @@ class PMFPanel(QWidget):
                     self.g_matrix = pd.DataFrame(g_vals.reshape(-1, self.current_factors))
                     
                     if self.diams is not None and len(self.f_matrix) == len(self.diams): 
-                        self.f_matrix.index = self.diams                 
+                        self.f_matrix.index = self.diams                         # Apply diameter index
                     
-                    if self.dates is not None:                           
+                    if self.dates is not None:                                   
                         if len(self.g_matrix) == len(self.dates):        
-                            self.g_matrix.index = self.dates             
+                            self.g_matrix.index = self.dates                     # Apply datetime index
                         else:                                            
-                            self.g_matrix.index = pd.date_range(self.dates.min(), periods=len(self.g_matrix), freq='D') 
+                            self.g_matrix.index = pd.date_range(self.dates.min(), periods=len(self.g_matrix), freq='D')
                             
                 except Exception as e:                                   
-                    self.f_matrix = None                                 
-                    self.g_matrix = None                                 
-                    QMessageBox.critical(self, "Data Load Error", f"Could not load the data for {text}.\n\nReason:\n{e}")
-
-    def open_renamer(self):
-        if self.current_factors == 0:                                    
-            QMessageBox.warning(self, "Error", "Please select a model from the Explorer first.") 
-            return
-        dialog = RenameDialog(self.current_factors, self.factor_names, self) 
-        dialog.exec()                                                    
+                    self.f_matrix = None                                         # Reset on fail
+                    self.g_matrix = None                                         # Reset on fail
+                    print(f"DEBUG: Load Failed: {e}")                            # Log to terminal
 
     def open_visualiser(self):
-        if self.f_matrix is None or self.g_matrix is None:               
-            QMessageBox.warning(self, "Error", "Data matrices not loaded. Make sure the batch ran successfully.") 
+        print("DEBUG: Visualiser button clicked.")                                 # Log the click
+        if self.f_matrix is None or self.g_matrix is None:
+            print("DEBUG: Guard failed! f_matrix or g_matrix is None.")           # This is why it's failing
+            QMessageBox.warning(self, "No Model Active", "Please select a run from the dropdown first.")
             return
         dialog = TabbedVisualizer(self, self)                            
         dialog.exec()                                                    
 
+    def open_renamer(self):
+        print("DEBUG: Renamer button clicked.")
+        if self.current_factors == 0:
+            return QMessageBox.warning(self, "No Data", "Select a model first.")
+        from gui.pmf_panel import RenameDialog                                   # Double check import path
+        dialog = RenameDialog(self.current_factors, self.factor_names, self)
+        dialog.exec()
+
     def _get_factor_name(self, col_idx):
         raw_name = f"Factor {col_idx + 1}"                               
         return self.factor_names.get(raw_name, raw_name)
+
+    def save_current_model(self):
+        if self.f_matrix is None:
+            return QMessageBox.warning(self, "Error", "Nothing to save. Select a model first.")
+        
+        name, ok = QInputDialog.getText(self, "Archive Model", "Name this solution:")
+        if not (ok and name): return
+        
+        archive_dir = os.path.join(self.working_dir, "saved_library", name)
+        os.makedirs(archive_dir, exist_ok=True)
+        
+        try:
+            fpeak_str = self.combo_fpeak.currentText().split("FPEAK:")[1].split(",")[0].strip()
+        except:
+            fpeak_str = str(self.current_fpeak)
+
+        f_src = os.path.join(self.run_dir, f"F_FACTOR_{self.current_factors}_{fpeak_str}.TXT")
+        g_src = os.path.join(self.run_dir, f"G_FACTOR_{self.current_factors}_{fpeak_str}.TXT")
+        
+        try:
+            shutil.copy(f_src, os.path.join(archive_dir, "F_MATRIX.TXT"))
+            shutil.copy(g_src, os.path.join(archive_dir, "G_MATRIX.TXT"))
+            
+            import json
+            meta = {
+                "factors": self.current_factors, 
+                "fpeak": self.current_fpeak, 
+                "names": self.factor_names, 
+                "chk_wide": self.chk_wide_pmf.isChecked(),
+                "diams": list(self.diams) if self.diams is not None else [] # Save the specific bins used
+            }
+            with open(os.path.join(archive_dir, "metadata.json"), 'w') as f:
+                json.dump(meta, f)
+            QMessageBox.information(self, "Success", f"Model archived to saved_library/{name}")
+        except Exception as e:
+            QMessageBox.critical(self, "Save Error", f"Could not find files to copy: {e}")
+
+    def load_from_library(self):
+        library_root = os.path.join(self.working_dir, "saved_library")                   # Define library path
+        selected_dir = QFileDialog.getExistingDirectory(self, "Select Archived Model", library_root)
+        if not selected_dir: return                                                      # Exit if cancelled
+        
+        try:
+            import json                                                                  # For meta parsing
+            with open(os.path.join(selected_dir, "metadata.json"), 'r') as f:
+                meta = json.load(f)                                                      # Unpack save info
+            
+            # 1. Restore Metadata & WidePMF State
+            self.current_factors = meta.get("factors", 0)                                # Set factors
+            self.current_fpeak = meta.get("fpeak", 0.0)                                  # Set fpeak
+            self.factor_names = meta.get("names", {})                                    # Restore factor names
+            self.chk_wide_pmf.setChecked(meta.get("chk_wide", False))                    # Flip WidePMF toggle
+            self.diams = np.array(meta.get("diams", []))                                 # Restore core diameters
+            
+            # 2. Load Matrices
+            f_vals = np.array(open(os.path.join(selected_dir, "F_MATRIX.TXT")).read().replace(',', ' ').split(), dtype=float)
+            g_vals = np.array(open(os.path.join(selected_dir, "G_MATRIX.TXT")).read().replace(',', ' ').split(), dtype=float)
+            
+            self.f_matrix = pd.DataFrame(f_vals.reshape(self.current_factors, -1).T)     # Rebuild F DataFrame
+            self.g_matrix = pd.DataFrame(g_vals.reshape(-1, self.current_factors))       # Rebuild G DataFrame
+            
+            # 3. Handle Indexing (The "Hours" Logic)
+            if len(self.diams) > 0:
+                if not self.chk_wide_pmf.isChecked():                                    # Standard PMF Mode
+                    if len(self.f_matrix) == len(self.diams):
+                        self.f_matrix.index = self.diams                                 # Direct diameter mapping
+                else:
+                    # WidePMF Mode: We leave the index as 0, 1, 2... 
+                    # The Visualiser will calculate: Hours = Total Columns / len(diams)
+                    print(f"DEBUG: WidePMF loaded. Profile length: {len(self.f_matrix)}")
+            
+            # 4. Restore Timestamps
+            if self.dates is not None:                                                   # Check if dates available
+                if len(self.g_matrix) == len(self.dates):
+                    self.g_matrix.index = self.dates                                     # Map to loaded timestamps
+                else:
+                    self.g_matrix.index = pd.date_range(self.dates.min(), periods=len(self.g_matrix), freq='D')
+            
+            self.lbl_fpeak.setText(f"Active Data (LIBRARY): {os.path.basename(selected_dir)}")
+            QMessageBox.information(self, "Loaded", f"Archived {'WidePMF' if meta.get('chk_wide') else 'Standard'} model restored.")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Load Error", f"Failed to reconstruct archived model:\n{e}")
+    
