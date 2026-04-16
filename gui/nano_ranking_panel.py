@@ -233,6 +233,28 @@ class NanoRankingPanel(QWidget):
             self.canvas_temp.draw()
         ExportDialog("Temporal Climatology", self.canvas_temp, self.fig_temp, restore, self).exec()
 
+    def _export_csv(self):
+        if self._results is None: return QMessageBox.warning(self, "No Data", "Calculate ranking first!")
+        path, _ = QFileDialog.getSaveFileName(self, "Save Nano Ranking Bins", "", "CSV Files (*.csv)")
+        if not path: return
+        
+        res_df = self._results['daily_df']
+        bins = [f"N_{i*5}_{(i+1)*5}" for i in range(20)]
+        
+        df_export = pd.DataFrame(index=res_df.index, columns=['date', 'percentile'] + bins)
+        df_export['date'] = df_export.index.strftime('%Y-%m-%d')
+        df_export['percentile'] = res_df['rank']
+        
+        for idx, row in res_df.iterrows():
+            rank = row['rank']
+            bin_idx = int(rank // 5)
+            if bin_idx >= 20: bin_idx = 19  # In case rank == 100
+            bin_name = bins[bin_idx]
+            df_export.loc[idx, bin_name] = row['delta_N']
+        
+        df_export.to_csv(path, index=False)
+        QMessageBox.information(self, "Success", "Nano ranking bins exported successfully!")
+
     # --- UI Builder ---
     def _build_ui(self):                                                     
         root = QVBoxLayout(self)                                             
@@ -312,6 +334,11 @@ class NanoRankingPanel(QWidget):
         self._run_btn = QPushButton("Calculate Ranking")                     
         self._run_btn.clicked.connect(self._start_ranking)                   
         layout.addWidget(self._run_btn)                                      
+        
+        self._export_btn = QPushButton("Export CSV")                        
+        self._export_btn.clicked.connect(self._export_csv)                  
+        self._export_btn.setEnabled(False)                                  
+        layout.addWidget(self._export_btn)                                  
         
         return box                                                           
 
@@ -442,6 +469,7 @@ class NanoRankingPanel(QWidget):
     def _on_worker_done(self, result: dict):                                 
         self._progress_bar.setVisible(False)                                 
         self._results = result                                               
+        self._export_btn.setEnabled(True)                                   
         self._redraw_visuals()                                               
 
     def _redraw_visuals(self):                                               
@@ -603,6 +631,20 @@ class NanoRankingPanel(QWidget):
         
         gs = self.fig_perc.add_gridspec(10, 2, hspace=0.6, wspace=0.4)       
         
+        # Compute global v_max
+        v_max_list = []
+        for i in range(20):                                                  
+            p_min, p_max = i * 5, (i + 1) * 5                                
+            days_in_bin = res_df[(res_df['rank'] > p_min) & (res_df['rank'] <= p_max)].index.date 
+            if len(days_in_bin) == 0: continue
+            mask = np.isin(df_norm, days_in_bin)                             
+            subset = self._df[mask]                                          
+            diurnal_mean = subset.groupby(subset.index.hour).mean()         
+            pnsd_vals = np.clip(diurnal_mean.values, 1e-4, None)            
+            v_max = v_max_user if v_max_user else max(pnsd_vals.max(), v_min*10)
+            v_max_list.append(v_max)
+        v_max_global = max(v_max_list) if v_max_list else v_min*10
+        
         for i in range(20):                                                  
             row, col = i // 2, i % 2                                         
             ax = self.fig_perc.add_subplot(gs[row, col])                     
@@ -621,33 +663,36 @@ class NanoRankingPanel(QWidget):
             diurnal_mean = subset.groupby(subset.index.hour).mean()          
             pnsd_vals = np.clip(diurnal_mean.values, 1e-4, None)             
             
-            v_max = v_max_user if v_max_user else max(pnsd_vals.max(), v_min*10) 
             mesh = ax.pcolormesh(diurnal_mean.index, self._diams, pnsd_vals.T, 
                                  cmap=self._cmap_combo.currentText(), 
-                                 norm=LogNorm(vmin=v_min, vmax=v_max), shading='auto') 
+                                 norm=LogNorm(vmin=v_min, vmax=v_max_global), shading='auto') 
             
             ax.set_yscale('log')                                             
-            ax.set_ylabel("Dp (nm)")                                         
+            if col == 0:
+                ax.set_ylabel("Dp (nm)")                                         
+            else:
+                ax.set_ylabel("")
             ax.set_title(f"Percentile ({p_min}, {p_max}%]")                  
             
             # --- Right Hand Axes ---
-            total_n = diurnal_mean.sum(axis=1) * dlogdp                      
-            target_n = diurnal_mean.iloc[:, mask_target].sum(axis=1) * dlogdp 
-            fraction = np.where(total_n > 0, target_n / total_n, 0)          
-            
-            ax_num = ax.twinx()                                              
-            ax_num.plot(diurnal_mean.index, total_n, color='red', lw=1.5, alpha=0.8) 
-            ax_num.set_ylabel(r"Total N", color='red')                       
-            ax_num.set_yscale('log')                                         
-            ax_num.tick_params(axis='y', colors='red')                       
-            
-            ax_frac = ax.twinx()                                             
-            ax_frac.spines['right'].set_position(('outward', 45))            
-            ax_frac.plot(diurnal_mean.index, fraction, color='green', lw=1.5, alpha=0.8) 
-            ax_frac.set_ylabel(r"Fraction", color='green')                   
-            ax_frac.set_ylim(0, 1.0)                                         
-            ax_frac.tick_params(axis='y', colors='green')                    
-            ax_frac.spines['right'].set_color('green')                       
+            if col == 1:
+                total_n = diurnal_mean.sum(axis=1) * dlogdp                      
+                target_n = diurnal_mean.iloc[:, mask_target].sum(axis=1) * dlogdp 
+                fraction = np.where(total_n > 0, target_n / total_n, 0)          
+                
+                ax_num = ax.twinx()                                              
+                ax_num.plot(diurnal_mean.index, total_n, color='red', lw=1.5, alpha=0.8) 
+                ax_num.set_ylabel(r"Total N", color='red')                       
+                ax_num.set_yscale('log')                                         
+                ax_num.tick_params(axis='y', colors='red')                       
+                
+                ax_frac = ax.twinx()                                             
+                ax_frac.spines['right'].set_position(('outward', 45))            
+                ax_frac.plot(diurnal_mean.index, fraction, color='green', lw=1.5, alpha=0.8) 
+                ax_frac.set_ylabel(r"Fraction", color='green')                   
+                ax_frac.set_ylim(0, 1.0)                                         
+                ax_frac.tick_params(axis='y', colors='green')                    
+                ax_frac.spines['right'].set_color('green')                       
 
         self.fig_perc.colorbar(mesh, ax=self.fig_perc.axes, orientation='vertical', fraction=0.02, pad=0.08, label="dN/dlogDp (cm-3)") 
         
