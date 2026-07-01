@@ -1,0 +1,256 @@
+/* ============================================================================
+   PyNSD shared stylesheet.
+   Tokens (@name@) are substituted from gui/theme.py PALETTE at load time.
+   This is the ONLY place visual styling should live — panels set object
+   names / `class` properties, never inline setStyleSheet().
+   ============================================================================ */
+
+/* ---- Base ------------------------------------------------------------- */
+QWidget {
+    background-color: @bg@;
+    color: @ink@;
+    font-family: "@sans@";
+    font-size: 13px;
+}
+
+QToolTip {
+    background-color: @ink@;
+    color: @bg@;
+    border: 1px solid @tan_active@;
+    padding: 4px;
+}
+
+/* ---- Headings --------------------------------------------------------- */
+QLabel#H1 {
+    font-family: "@serif@";
+    font-size: 26px;
+    font-weight: bold;
+    color: @ink@;
+}
+QLabel#H2 {
+    font-size: 16px;
+    font-weight: bold;
+    color: @ink@;
+}
+QLabel#Hint, QLabel#StatsLabel {
+    color: @muted@;
+}
+QLabel#StatsLabel {
+    font-weight: bold;
+}
+QLabel#EditingStrip {
+    background-color: @selection@;
+    border: 1px solid @border@;
+    border-radius: 4px;
+    padding: 6px 10px;
+    font-weight: bold;
+}
+
+/* ---- Buttons ---------------------------------------------------------- */
+QPushButton {
+    background-color: @tan@;
+    border: 1px solid @tan_active@;
+    border-radius: 4px;
+    padding: 6px 12px;
+}
+QPushButton:hover   { background-color: @tan_hover@; }
+QPushButton:pressed { background-color: @tan_active@; }
+QPushButton:disabled {
+    background-color: @bg@;
+    color: @tan_active@;
+    border: 1px solid @border@;
+}
+
+/* Primary — the single dominant action */
+QPushButton[class="primary"] {
+    background-color: @primary@;
+    color: @primary_text@;
+    border: 1px solid @primary@;
+    border-radius: 6px;
+    padding: 10px 22px;
+    font-size: 15px;
+    font-weight: bold;
+}
+QPushButton[class="primary"]:hover    { background-color: @primary_hover@; }
+QPushButton[class="primary"]:disabled {
+    background-color: @tan_hover@;
+    color: @muted@;
+    border: 1px solid @border@;
+}
+
+/* Secondary — grouped/neutral actions */
+QPushButton[class="secondary"] {
+    background-color: @tan@;
+    border: 1px solid @tan_active@;
+    font-weight: bold;
+}
+QPushButton[class="secondary"]:hover { background-color: @tan_hover@; }
+
+/* Destructive — quiet, only emphasised on hover */
+QPushButton[class="destructive"] {
+    background-color: transparent;
+    color: @destructive@;
+    border: 1px solid @border@;
+}
+QPushButton[class="destructive"]:hover {
+    background-color: @destructive@;
+    color: @bg@;
+    border: 1px solid @destructive@;
+}
+
+/* Info "ℹ️" affordance */
+QPushButton#InfoButton {
+    background: transparent;
+    border: none;
+    font-size: 15px;
+    padding: 0;
+}
+QPushButton#InfoButton:hover { background: transparent; }
+
+/* ---- Inputs ----------------------------------------------------------- */
+QLineEdit, QComboBox, QSpinBox, QDateEdit {
+    background-color: @surface@;
+    border: 1px solid @border@;
+    border-radius: 4px;
+    padding: 4px 6px;
+    selection-background-color: @tan_hover@;
+    selection-color: @ink@;
+}
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDateEdit:focus {
+    border: 1px solid @tan_active@;
+}
+QComboBox::drop-down { border: none; width: 18px; }
+QComboBox QAbstractItemView {
+    background-color: @surface@;
+    border: 1px solid @border@;
+    selection-background-color: @selection@;
+    selection-color: @ink@;
+}
+
+/* ---- Group boxes ------------------------------------------------------ */
+QGroupBox {
+    border: 1px solid @border@;
+    border-radius: 6px;
+    margin-top: 14px;
+    padding: 10px;
+    background-color: @bg@;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 10px;
+    padding: 0 4px;
+    color: @muted@;
+    font-weight: bold;
+}
+
+/* ---- Collapsible section header -------------------------------------- */
+QToolButton#SectionHeader {
+    background-color: @selection@;
+    border: 1px solid @border@;
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 14px;
+    font-weight: bold;
+    text-align: left;
+}
+QToolButton#SectionHeader:hover { background-color: @tan_hover@; }
+
+/* ---- Tables ----------------------------------------------------------- */
+QTableWidget, QTableView {
+    background-color: @surface@;
+    border: 1px solid @border@;
+    gridline-color: @border@;
+}
+QHeaderView::section {
+    background-color: @selection@;
+    color: @ink@;
+    border: none;
+    border-right: 1px solid @border@;
+    border-bottom: 1px solid @border@;
+    padding: 4px 6px;
+    font-weight: bold;
+}
+
+/* ---- Left navigation -------------------------------------------------- */
+QListWidget#NavList {
+    background-color: @selection@;
+    border: none;
+    border-right: 1px solid @border@;
+    outline: 0;
+    padding: 8px 6px;
+}
+QListWidget#NavList::item {
+    padding: 8px 12px;
+    border-radius: 5px;
+    margin: 1px 4px;
+}
+QListWidget#NavList::item:selected {
+    background-color: @primary@;
+    color: @primary_text@;
+}
+QListWidget#NavList::item:hover:!selected {
+    background-color: @tan_hover@;
+}
+QListWidget#NavList::item:disabled {
+    color: @muted@;
+}
+
+/* ---- Scroll areas ----------------------------------------------------- */
+QScrollArea { border: none; }
+
+/* ---- Progress bar ----------------------------------------------------- */
+QProgressBar {
+    border: 1px solid @border@;
+    border-radius: 4px;
+    background-color: @surface@;
+    text-align: center;
+}
+QProgressBar::chunk { background-color: @tan_active@; }
+
+/* ---- Tab widgets (panels that still use internal tabs) ---------------- */
+QTabWidget::pane { border: 1px solid @border@; top: -1px; }
+QTabBar::tab {
+    background: @selection@;
+    padding: 8px 18px;
+    border: 1px solid @border@;
+    border-bottom: none;
+    border-top-left-radius: 4px;
+    border-top-right-radius: 4px;
+}
+QTabBar::tab:selected { background: @bg@; font-weight: bold; }
+
+/* ---- Landing ---------------------------------------------------------- */
+QLabel#LandingTitle {
+    font-family: "@serif@";
+    font-size: 82px;
+    font-weight: bold;
+    color: @ink@;
+}
+QLabel#LandingSubtitle { font-size: 28px; color: @muted@; }
+QLabel#LandingDescription { font-size: 22px; color: @ink@; }
+
+/* ---- Pinned files pane (Load panel) ---------------------------------- */
+QWidget#FilesPane {
+    background-color: @selection@;
+    border-top: 2px solid @tan_active@;
+}
+
+/* ---- File entry rows (Load panel) ------------------------------------ */
+FileEntryWidget {
+    background-color: @surface@;
+    border: 1px solid @border@;
+    border-radius: 4px;
+}
+FileEntryWidget[selected="true"] {
+    background-color: @selection@;
+    border: 2px solid @tan_active@;
+}
+QLabel#FileName   { font-weight: bold; font-size: 13px; }
+QLabel#FileStatus { color: @muted@; font-size: 12px; }
+QLabel#FileStatus[status="ok"]  { color: #2e7d32; }
+QLabel#FileStatus[status="err"] { color: @destructive@; }
+QLabel#PreviewIcon {
+    background-color: @tan_hover@;
+    border-radius: 4px;
+}

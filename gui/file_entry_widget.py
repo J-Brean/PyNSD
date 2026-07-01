@@ -14,7 +14,7 @@ class FileEntryWidget(QFrame):
         super().__init__(parent)
         self.path = path
         self.setFrameShape(QFrame.Shape.StyledPanel)
-        self.setStyleSheet("FileEntryWidget { background-color: #fdfdfd; border: 1px solid #ddd; border-radius: 4px; }")
+        self.setProperty("selected", False)
         self._build_ui()
 
     def _build_ui(self):
@@ -24,11 +24,11 @@ class FileEntryWidget(QFrame):
         # --- Top Row (Summary) ---
         top_row = QHBoxLayout()
         self.lbl_name = QLabel(Path(self.path).name)
-        self.lbl_name.setStyleSheet("font-weight: bold; font-size: 13px;")
+        self.lbl_name.setObjectName("FileName")
         top_row.addWidget(self.lbl_name)
-        
+
         self.lbl_status = QLabel("Parsing...")
-        self.lbl_status.setStyleSheet("color: #777; font-size: 12px;")
+        self.lbl_status.setObjectName("FileStatus")
         top_row.addWidget(self.lbl_status)
         top_row.addStretch()
 
@@ -112,21 +112,21 @@ class FileEntryWidget(QFrame):
         super().mousePressEvent(event)
 
     def set_selected_style(self, selected: bool):
-        if selected:
-            self.setStyleSheet("FileEntryWidget { background-color: #e6f2ff; border: 2px solid #0078d7; border-radius: 4px; }")
-        else:
-            self.setStyleSheet("FileEntryWidget { background-color: #fdfdfd; border: 1px solid #ddd; border-radius: 4px; }")
+        self.setProperty("selected", "true" if selected else "false")
+        self.style().unpolish(self)
+        self.style().polish(self)
 
     def set_result(self, result: DataFile):
         if result.ok:
-            color = "green"
             status_text = f"✓ {result.size_str} | {result.n_rows} rows | {result.n_bins} bins"
+            self.lbl_status.setProperty("status", "ok")
         else:
-            color = "red"
             status_text = "❌ Error"
-        
+            self.lbl_status.setProperty("status", "err")
+
         self.lbl_status.setText(status_text)
-        self.lbl_status.setStyleSheet(f"color: {color}; font-size: 12px;")
+        self.lbl_status.style().unpolish(self.lbl_status)
+        self.lbl_status.style().polish(self.lbl_status)
 
     # --- Effective Value Methods ---
     def overrides_active(self) -> bool:

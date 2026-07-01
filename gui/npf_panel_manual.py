@@ -590,10 +590,18 @@ class NPFPanel(QWidget):
         self.mode_overrides = {}                                                     
         self.refining_modes = False                                                  
         self.picking_points = False                                                  
-        self.points = []                                                             
-        self.last_csv_path = None                                                    
-        
-        self._build_ui()                                                             
+        self.points = []
+        self.last_csv_path = None
+
+        # Master results file: one row per timestamp, seeded with every day so
+        # results are *updated in place* (no duplicate / missed days).
+        self.RESULT_COLS = ['Class', 'NPF_start_date', 'In_GR_Window', 'J_Window',
+                            'Mode_Dp', 'GR', 'J', 'J[dNdt]', 'J[GR]', 'J[coag]',
+                            'CS', 'm', 'J1.5']
+        self.master_csv = None
+        self._sent_days = set()
+
+        self._build_ui()
 
     def _show_info_dialog(self, title, text):
         info = QMessageBox(self)
@@ -850,6 +858,7 @@ class NPFPanel(QWidget):
 
         self.btn_calc_j = QPushButton("✨Calc J & CS"); self.btn_calc_j.clicked.connect(self.calculate_j_and_cs); j_layout.addWidget(self.btn_calc_j)
         self.btn_set_csv = QPushButton("📁Choose CSV"); self.btn_set_csv.clicked.connect(self._choose_new_csv); j_layout.addWidget(self.btn_set_csv)
+        j_layout.addWidget(QLabel("Event #")); self.val_event = QLineEdit("1"); self.val_event.setFixedWidth(36); j_layout.addWidget(self.val_event)
         self.btn_export = QPushButton("💾Send to CSV"); self.btn_export.clicked.connect(self.export_to_csv); j_layout.addWidget(self.btn_export)
         
         self.btn_coags_map = QPushButton("🔥CoagS Map")
@@ -865,7 +874,8 @@ class NPFPanel(QWidget):
             "<b>✨ Calc J & CS:</b> Runs the physics equations for Coagulation Sink, Condensation Sink, and Formation Rate based on your fitted Growth Rate.<br><br>"
             "<b>Burst Events:</b> If you classify a day as 'Burst' and do not calculate a GR, the algorithm will automatically assume a GR of 1.0 nm/h to estimate J.<br><br>"
             "<b>🔥 CoagS Map:</b> Pops up a full 24-hour heatmap showing the calculated Coagulation Sink matrix for the active day.<br><br>"
-            "<b>💾 Send to CSV:</b> Writes the current day's calculated row into the CSV file and the table below. (Missing columns are handled safely via pandas concat)."
+            "<b>Event #:</b> The label for this event. Re-sending the same number overwrites that event in place (no duplicates). Use different numbers for separate events — including a second event on the same day. In 48h mode an event continuing past midnight is logged in full under one event number, even though its dates repeat.<br><br>"
+            "<b>💾 Send to CSV:</b> Choosing a CSV first auto-generates a master file listing every timestamp; sending writes/updates the current event's rows in place."
         )
         self.btn_calc_info = QPushButton("ℹ️"); self.btn_calc_info.setFixedSize(24, 24)
         self.btn_calc_info.clicked.connect(lambda: self._show_info_dialog("Calculation Info", calc_info))
@@ -873,8 +883,8 @@ class NPFPanel(QWidget):
         
         ctrl_layout.addLayout(j_layout)
 
-        self.csv_table = QTableWidget(0, 14)
-        self.csv_table.setHorizontalHeaderLabels(["Date", "Class", "NPF Start", "In Window", "J_Window", "Mode Dp", "GR", "J", "J[dNdt]", "J[GR]", "J[coag]", "CS", "m", "J1.5"])
+        self.csv_table = QTableWidget(0, 15)
+        self.csv_table.setHorizontalHeaderLabels(["Date", "Event", "Class", "NPF Start", "In Window", "J_Window", "Mode Dp", "GR", "J", "J[dNdt]", "J[GR]", "J[coag]", "CS", "m", "J1.5"])
         self.csv_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         ctrl_layout.addWidget(self.csv_table)
         bot_layout.addWidget(ctrl_panel, stretch=1)
@@ -1260,7 +1270,10 @@ class NPFPanel(QWidget):
         except ValueError: return QMessageBox.warning(self, "Input Error", "Inputs must be numbers.")
         
         j_window_str = f"{j_min}-{j_max}"
-        pnsd = self.day_df.to_numpy()
+        # Compute over the active window: in 48h mode this spans into the next
+        # day so events continuing past midnight are logged too.
+        calc_df = self._get_active_df()
+        pnsd = calc_df.to_numpy()
         cs_series = calc_condensation_sink(self.diams, pnsd, dlogdp)
         coags_matrix = calc_coagulation_sink(self.diams, pnsd, dlogdp)
         j_total, dN_dt, gr_term, coag_term = calc_formation_rate(self.diams, pnsd, dlogdp, gr_to_use, j_min, j_max, coags_matrix)
@@ -1282,24 +1295,24 @@ class NPFPanel(QWidget):
             else:
                 j15_series = j_total
         
-        dates = mdates.date2num(self.day_df.index)
-        mode_dps = np.full(len(dates), np.nan)                                       
-        in_window = np.zeros(len(dates), dtype=int)                                  
-        
+        dates = mdates.date2num(calc_df.index)
+        mode_dps = np.full(len(dates), np.nan)
+        in_window = np.zeros(len(dates), dtype=int)
+
         if getattr(self, 'last_box_bounds', None):
             t_min, t_max, _, _ = self.last_box_bounds
             snapshot_dict = {snap[0]: snap[3] for snap in getattr(self, 'fit_snapshots', [])}
-            
+
             for i, d in enumerate(dates):
-                if t_min <= d <= t_max:                                              
-                    in_window[i] = 1                                                 
+                if t_min <= d <= t_max:
+                    in_window[i] = 1
                     if d in snapshot_dict:
-                        mode_dps[i] = snapshot_dict[d]                               
+                        mode_dps[i] = snapshot_dict[d]
                     else:
-                        mode_dps[i] = self.diams[np.argmax(pnsd[i])]                 
-        
+                        mode_dps[i] = self.diams[np.argmax(pnsd[i])]
+
         self.j_cs_data = pd.DataFrame({
-            'date': self.day_df.index, 
+            'date': calc_df.index,
             'Class': active_class,
             'NPF_start_date': start_date,
             'In_GR_Window': in_window,
@@ -1311,9 +1324,9 @@ class NPFPanel(QWidget):
             'J1.5': j15_series
         }).set_index('date')
         
-        self.ax_j.clear(); self.ax_cs.clear(); time_axis = self.day_df.index
+        self.ax_j.clear(); self.ax_cs.clear(); time_axis = calc_df.index
         self.ax_j.plot(time_axis, j_total, color='blue', label='J')
-        
+
         if self.chk_j15.isChecked():
             self.ax_j.plot(time_axis, j15_series, color='purple', linestyle='--', label='J1.5')
             
@@ -1328,55 +1341,120 @@ class NPFPanel(QWidget):
         self.ax_j.xaxis.set_major_locator(mdates.HourLocator(interval=4)); self.ax_j.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
         self.fig_diur.tight_layout(pad=1.5); self.canvas_diur.draw()
 
+    @property
+    def MASTER_COLS(self):
+        return ['Event'] + self.RESULT_COLS
+
+    def _read_event_number(self) -> int:
+        try:
+            return max(1, int(float(self.val_event.text())))
+        except (ValueError, AttributeError):
+            return 1
+
+    def _build_seed_master(self) -> pd.DataFrame:
+        """Baseline frame: one row per timestamp (Event 0) listing every day, so
+        nothing is missed. Logged events are added on top as Event >= 1 rows."""
+        master = pd.DataFrame(index=self.df.index, columns=self.MASTER_COLS)
+        master.index.name = 'date'
+
+        class_by_date = {pd.to_datetime(k).date(): v for k, v in self.classifications.items()}
+        ts_dates = pd.Series(self.df.index, index=self.df.index).dt.date
+        master['Event'] = 0
+        master['Class'] = ts_dates.map(class_by_date).fillna("Non-NPF").values
+        master['NPF_start_date'] = self.df.index.date
+        master['In_GR_Window'] = 0
+        master['J_Window'] = "N/A"
+        return master
+
+    def _init_master_csv(self, path: str):
+        """Create (or resume) the master CSV: baseline timeline + any saved events."""
+        if self.df is None:
+            QMessageBox.warning(self, "No Data", "Load data before choosing a CSV.")
+            return False
+
+        self.master_csv = self._build_seed_master()
+        if os.path.exists(path):
+            try:                                                      # resume saved events
+                existing = pd.read_csv(path, index_col=0, parse_dates=True)
+                if 'Event' in existing.columns:
+                    saved = existing[existing['Event'].fillna(0).astype(int) != 0]
+                    if not saved.empty:
+                        saved = saved.reindex(columns=self.MASTER_COLS)
+                        self.master_csv = pd.concat([self.master_csv, saved])
+            except Exception:
+                pass
+
+        self.last_csv_path = path
+        self._save_master()
+        self.btn_export.setText(f"Send to CSV ({os.path.basename(path)})")
+        self._rebuild_csv_table()
+        return True
+
+    def _save_master(self):
+        if self.master_csv is not None and self.last_csv_path:
+            self.master_csv.sort_index(kind='stable').to_csv(self.last_csv_path)
+
+    def _rebuild_csv_table(self):
+        """Redraw the table from the logged events (Event >= 1), no duplicates."""
+        self.csv_table.setRowCount(0)
+        if self.master_csv is None:
+            return
+        fmt = lambda v, f: "NA" if pd.isna(v) else f"{v:{f}}"
+        events = self.master_csv['Event'].fillna(0).astype(int)
+        shown = self.master_csv[events != 0]
+        shown = shown.reset_index().sort_values(['Event', 'date']).set_index('date')
+        for index, row in shown.iterrows():
+            r_idx = self.csv_table.rowCount()
+            self.csv_table.insertRow(r_idx)
+            self.csv_table.setItem(r_idx, 0, QTableWidgetItem(str(index)))
+            self.csv_table.setItem(r_idx, 1, QTableWidgetItem(str(int(row['Event']))))
+            self.csv_table.setItem(r_idx, 2, QTableWidgetItem(str(row['Class'])))
+            self.csv_table.setItem(r_idx, 3, QTableWidgetItem(str(row['NPF_start_date'])))
+            self.csv_table.setItem(r_idx, 4, QTableWidgetItem(str(int(row['In_GR_Window'])) if pd.notna(row['In_GR_Window']) else "0"))
+            self.csv_table.setItem(r_idx, 5, QTableWidgetItem(str(row['J_Window'])))
+            self.csv_table.setItem(r_idx, 6, QTableWidgetItem(fmt(row['Mode_Dp'], '.2f')))
+            self.csv_table.setItem(r_idx, 7, QTableWidgetItem(fmt(row['GR'], '.3f')))
+            self.csv_table.setItem(r_idx, 8, QTableWidgetItem(fmt(row['J'], '.3e')))
+            self.csv_table.setItem(r_idx, 9, QTableWidgetItem(fmt(row['J[dNdt]'], '.3e')))
+            self.csv_table.setItem(r_idx, 10, QTableWidgetItem(fmt(row['J[GR]'], '.3e')))
+            self.csv_table.setItem(r_idx, 11, QTableWidgetItem(fmt(row['J[coag]'], '.3e')))
+            self.csv_table.setItem(r_idx, 12, QTableWidgetItem(fmt(row['CS'], '.3e')))
+            self.csv_table.setItem(r_idx, 13, QTableWidgetItem(fmt(row['m'], '.3f')))
+            self.csv_table.setItem(r_idx, 14, QTableWidgetItem(fmt(row['J1.5'], '.3e')))
+
     def _choose_new_csv(self):
         path, _ = QFileDialog.getSaveFileName(self, "Set CSV Output File", "", "CSV Files (*.csv)")
         if path:
-            self.last_csv_path = path
-            self.btn_export.setText(f"Send to CSV ({os.path.basename(path)})")
+            self._init_master_csv(path)
 
     def export_to_csv(self):
         if self.j_cs_data is None:
             self.calculate_j_and_cs()
-            
+
         if self.j_cs_data is None: return
-        
-        if not self.last_csv_path: 
-            path, _ = QFileDialog.getSaveFileName(self, "Append or Save Analysis to CSV", "", "CSV Files (*.csv)")
+
+        if not self.last_csv_path:
+            path, _ = QFileDialog.getSaveFileName(self, "Choose master CSV file", "", "CSV Files (*.csv)")
             if not path: return
-            self.last_csv_path = path                                                
-            self.btn_export.setText(f"Send to CSV ({os.path.basename(path)})")       
-            
-        path = self.last_csv_path 
-        
+            if not self._init_master_csv(path): return
+
         try:
-            if os.path.exists(path):
-                existing_df = pd.read_csv(path, index_col=0, parse_dates=True)
-                combined_df = pd.concat([existing_df, self.j_cs_data])
-                combined_df.to_csv(path)
-            else:
-                self.j_cs_data.to_csv(path)           
-            
-            for index, row in self.j_cs_data.iterrows():
-                r_idx = self.csv_table.rowCount()                                    
-                self.csv_table.insertRow(r_idx)                                      
-                fmt = lambda v, f: "NA" if pd.isna(v) else f"{v:{f}}"                
-                
-                self.csv_table.setItem(r_idx, 0, QTableWidgetItem(str(index)))
-                self.csv_table.setItem(r_idx, 1, QTableWidgetItem(str(row['Class'])))
-                self.csv_table.setItem(r_idx, 2, QTableWidgetItem(str(row['NPF_start_date'])))
-                self.csv_table.setItem(r_idx, 3, QTableWidgetItem(str(int(row['In_GR_Window']))))
-                self.csv_table.setItem(r_idx, 4, QTableWidgetItem(str(row['J_Window'])))
-                self.csv_table.setItem(r_idx, 5, QTableWidgetItem(fmt(row['Mode_Dp'], '.2f')))
-                self.csv_table.setItem(r_idx, 6, QTableWidgetItem(fmt(row['GR'], '.3f')))
-                self.csv_table.setItem(r_idx, 7, QTableWidgetItem(fmt(row['J'], '.3e')))
-                self.csv_table.setItem(r_idx, 8, QTableWidgetItem(fmt(row['J[dNdt]'], '.3e')))
-                self.csv_table.setItem(r_idx, 9, QTableWidgetItem(fmt(row['J[GR]'], '.3e')))
-                self.csv_table.setItem(r_idx, 10, QTableWidgetItem(fmt(row['J[coag]'], '.3e')))
-                self.csv_table.setItem(r_idx, 11, QTableWidgetItem(fmt(row['CS'], '.3e')))
-                self.csv_table.setItem(r_idx, 12, QTableWidgetItem(fmt(row['m'], '.3f')))
-                self.csv_table.setItem(r_idx, 13, QTableWidgetItem(fmt(row['J1.5'], '.3e')))
-        except Exception as e: 
-            QMessageBox.critical(self, "Error", str(e))                              
+            event_no = self._read_event_number()
+            block = self.j_cs_data.reindex(columns=self.RESULT_COLS).copy()
+            block.insert(0, 'Event', event_no)
+
+            # Replace any previous rows for THIS event number (idempotent re-send),
+            # while keeping the baseline (Event 0) and other events intact. This is
+            # what lets one event span past midnight without colliding with the
+            # next day's own event — they carry different event numbers.
+            events = self.master_csv['Event'].fillna(0).astype(int)
+            self.master_csv = self.master_csv[events != event_no]
+            self.master_csv = pd.concat([self.master_csv, block])
+            self._save_master()
+            self._rebuild_csv_table()
+            self.val_event.setText(str(event_no + 1))     # ready for the next event
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
 
     def _show_diurnals(self):
         try:

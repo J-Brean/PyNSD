@@ -16,7 +16,10 @@ from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QFileDi
                              QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget, QDialog, QMessageBox, QInputDialog,
                              QDateEdit, QSpinBox, QCheckBox, QToolTip)
 from gui.file_entry_widget import FileEntryWidget
-from utils.data_loader import (DATE_COLUMN_OPTIONS, DATE_FORMAT_OPTIONS, DEFAULT_DATE_COL, DEFAULT_DATE_FMT, 
+from gui.widgets import CollapsibleSection, make_form
+from gui.theme import (FIELD_MIN_WIDTH, NARROW_FIELD_MIN_WIDTH,
+                       SPACE_SM, SPACE_MD, SPACE_LG)
+from utils.data_loader import (DATE_COLUMN_OPTIONS, DATE_FORMAT_OPTIONS, DEFAULT_DATE_COL, DEFAULT_DATE_FMT,
                                DataFile, load_pnsd_file, apply_qc_filter, calculate_line_losses, align_bins)
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -73,7 +76,7 @@ class HarmoniseDialog(QDialog):
         # --- Execution Buttons ---
         btn_box = QHBoxLayout()
         self.btn_apply = QPushButton("✨ Apply Harmonisation")
-        self.btn_apply.setStyleSheet("font-weight: bold; background-color: #c4d1ba; padding: 8px;")
+        self.btn_apply.setProperty("class", "primary")
         self.btn_apply.clicked.connect(self.accept)
         btn_box.addStretch()
         btn_box.addWidget(self.btn_apply)
@@ -166,13 +169,13 @@ class DateTimeFilterDialog(QDialog):
         
         # --- Stats Label ---
         self.stats_label = QLabel()
-        self.stats_label.setStyleSheet("font-weight: bold; color: #333;")
+        self.stats_label.setObjectName("StatsLabel")
         layout.addWidget(self.stats_label)
-        
+
         # --- Buttons ---
         btn_box = QHBoxLayout()
         self.btn_apply = QPushButton("✨ Apply Filter")
-        self.btn_apply.setStyleSheet("font-weight: bold; background-color: #c4d1ba; padding: 8px;")
+        self.btn_apply.setProperty("class", "primary")
         self.btn_apply.clicked.connect(self.accept)
         btn_box.addStretch()
         btn_box.addWidget(self.btn_apply)
@@ -400,12 +403,12 @@ class DiameterFilterDialog(QDialog):
         layout.addWidget(self.canvas)
 
         self.stats_lbl = QLabel()
-        self.stats_lbl.setStyleSheet("font-weight: bold; color: #333;")
+        self.stats_lbl.setObjectName("StatsLabel")
         layout.addWidget(self.stats_lbl)
 
         btns = QHBoxLayout()
         self.btn_apply = QPushButton("✨ Apply Diameter Filter")
-        self.btn_apply.setStyleSheet("font-weight: bold; background-color: #c4d1ba; padding: 8px;")
+        self.btn_apply.setProperty("class", "primary")
         self.btn_apply.clicked.connect(self.accept)
         btns.addStretch()
         btns.addWidget(self.btn_apply)
@@ -516,299 +519,395 @@ class LoadPanel(QWidget):
         self.setAcceptDrops(True)
 
     def _info_btn(self, text, title="Information"):
-        btn = QPushButton("ℹ️") 
-        btn.setFixedSize(24, 24) 
+        btn = QPushButton("ℹ️")
+        btn.setObjectName("InfoButton")
+        btn.setFixedSize(24, 24)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn.setStyleSheet("border: none; font-size: 16px;") 
         btn.clicked.connect(lambda: QMessageBox.information(self, title, text))
         return btn
 
+    def _field_row(self, *widgets):
+        """Pack widgets (fields + info buttons) into a left-aligned row for forms."""
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(SPACE_SM)
+        for w in widgets:
+            row.addWidget(w)
+        row.addStretch()
+        container = QWidget()
+        container.setLayout(row)
+        return container
+
     def _build_ui(self):
         root = QVBoxLayout(self)
-        root.setSpacing(10)
-        root.setContentsMargins(14, 14, 14, 10)
+        root.setSpacing(SPACE_MD)
+        root.setContentsMargins(SPACE_LG, SPACE_LG, SPACE_LG, SPACE_MD)
 
-        intro_layout = QHBoxLayout()
-        intro_lbl = QLabel("Load & Prepare Data")
-        intro_lbl.setStyleSheet("font-size: 16px; font-weight: bold;")
-        
+        # ── Header strip: title + how-to + "Editing: <file>" ──────────── #
+        header = QHBoxLayout()
+        title = QLabel("Load & prepare data")
+        title.setObjectName("H2")
         intro_text = (
             "Data Pipeline:\n"
             "1. Add files and parse datetimes/timezones.\n"
             "2. Apply QC to strip spikes, or correct for line-losses.\n"
-            "3. Ctrl-click multiple files in the list, then use the Merge buttons to combine them.\n"
-            "4. Export any dataset from the preview to CSV."
+            "3. Ctrl-click multiple files in the list, then use the Combine buttons.\n"
+            "4. Export any dataset, or proceed with the selected one."
         )
-        intro_layout.addWidget(intro_lbl)
-        intro_layout.addWidget(self._info_btn(intro_text, "How to use this tool"))
-        intro_layout.addStretch()
-        root.addLayout(intro_layout)
+        header.addWidget(title)
+        header.addWidget(self._info_btn(intro_text, "How to use this tool"))
+        header.addStretch()
+        self._editing_lbl = QLabel("Editing: —")
+        self._editing_lbl.setObjectName("EditingStrip")
+        header.addWidget(self._editing_lbl)
+        root.addLayout(header)
 
-        settings_splitter = QSplitter(Qt.Orientation.Horizontal)
-        
-        import_box = QGroupBox("Import Settings") 
-        import_layout = QVBoxLayout(import_box)
-        
-        row1 = QHBoxLayout()
-        row1.addWidget(QLabel("Date Col:"))
-        row1.addWidget(self._info_btn("The exact name of the column in your CSV containing the timestamp.", "Date Column"))
-        
-        self._col_combo = QComboBox()
-        self._col_combo.addItems(DATE_COLUMN_OPTIONS)
-        self._col_combo.currentTextChanged.connect(self._on_col_changed)
-        row1.addWidget(self._col_combo)
-        
-        self._custom_col = QLineEdit()
-        self._custom_col.setPlaceholderText("Enter custom column name...")
-        self._custom_col.setVisible(False)
-        row1.addWidget(self._custom_col)
-        
-        row1.addWidget(QLabel("Format:"))
-        row1.addWidget(self._info_btn("The structural format of your dates. Use 'Custom...' if none match perfectly.", "Date Format"))
-        self._fmt_combo = QComboBox()
-        sorted_fmts = sorted(DATE_FORMAT_OPTIONS, key=lambda x: 0 if str(x[0]).upper().startswith('Y') else (1 if str(x[0]).upper().startswith('D') else 2)) 
-        for disp, _ in sorted_fmts: self._fmt_combo.addItem(disp) 
-        self._fmt_combo.currentIndexChanged.connect(self._on_fmt_changed)
-        row1.addWidget(self._fmt_combo)
-        
-        self._custom_fmt = QLineEdit()
-        self._custom_fmt.setPlaceholderText("e.g., yyyy/MM/dd HH:mm:ss")
-        self._custom_fmt.setVisible(False)
-        row1.addWidget(self._custom_fmt)
-        
-        import_layout.addLayout(row1)
-        
-        row2 = QHBoxLayout()
-        row2.addWidget(QLabel("Timezone:"))
-        row2.addWidget(self._info_btn("Standardises your data to a specific timezone (e.g., 'UTC', 'Europe/London'). Protects against DST gaps.", "Timezone"))
-        self._tz_input = QLineEdit("UTC")
-        row2.addWidget(self._tz_input)
-        
-        row2.addWidget(QLabel("Avg:"))
-        row2.addWidget(self._info_btn("Optional: Average your data to a new timebase (e.g., enter '15' and select 'Minutes' to downsample).", "Timebase Averaging"))
-        self._resample_val = QLineEdit()
-        self._resample_val.setPlaceholderText("Val")
-        self._resample_val.setFixedWidth(40)
-        row2.addWidget(self._resample_val)
-        self._resample_unit = QComboBox()
-        self._resample_unit.addItems(["Minutes", "Hours", "Days"])
-        row2.addWidget(self._resample_unit)
-        import_layout.addLayout(row2)
-        
-        row3 = QHBoxLayout()
-        row3.addWidget(QLabel("NAs:"))
-        row3.addWidget(self._info_btn("How to handle missing data.\nDrop: Removes the row.\nFill: Copies last valid value.\nInterpolate: Draws a line.\nFill Min: Replaces with 1e0.", "Missing Data Handling"))
-        self._na_combo = QComboBox()
-        self._na_combo.addItems(["Drop Rows", "Fill (Fwd/Bwd)", "Interpolate", "Fill Min (1e0)"])
-        row3.addWidget(self._na_combo)
-        
-        row3.addWidget(QLabel("Drop Cols:"))
-        row3.addWidget(self._info_btn("Comma-separated list of columns to ignore completely (e.g., 'Status, Error Code').", "Drop Columns"))
-        self._drop_cols = QLineEdit()
-        self._drop_cols.setPlaceholderText("Comma sep...")
-        row3.addWidget(self._drop_cols)
-        import_layout.addLayout(row3)
+        # ── Accordion of workflow steps inside a scroll area ──────────── #
+        # Order: set import settings first, then corrections, then combine.
+        scroll_outer = QScrollArea()
+        scroll_outer.setWidgetResizable(True)
+        inner = QWidget()
+        sections = QVBoxLayout(inner)
+        sections.setContentsMargins(0, 0, 0, 0)
+        sections.setSpacing(SPACE_MD)
+        sections.addWidget(self._build_import_section())
+        sections.addWidget(self._build_corrections_section())
+        sections.addWidget(self._build_combine_section())
+        sections.addStretch()
+        scroll_outer.setWidget(inner)
+        root.addWidget(scroll_outer, stretch=5)
 
-        row_flag = QHBoxLayout()
-        row_flag.addWidget(QLabel("Flag Col:"))
-        row_flag.addWidget(self._info_btn(
-            "Optional: name of a 'flag' column in your CSV.\n"
-            "Rows where that column equals the Error Value will be deleted before any other processing.\n"
-            "Leave blank to skip. Default error value is 1 (e.g. 0 = clean, 1 = flagged).",
-            "Error Flag Filtering"
-        ))
-        self._flag_col = QLineEdit()
-        self._flag_col.setPlaceholderText("e.g., flag")
-        row_flag.addWidget(self._flag_col)
+        # ── Files + preview: pinned to the bottom, always visible ─────── #
+        root.addWidget(self._build_files_area(), stretch=2)
 
-        row_flag.addWidget(QLabel("Error Value:"))
-        self._flag_val = QLineEdit("1")
-        self._flag_val.setFixedWidth(50)
-        row_flag.addWidget(self._flag_val)
-        row_flag.addStretch()
-        import_layout.addLayout(row_flag)
-        
-        apply_btn = QPushButton("Apply to all loaded files")
-        apply_btn.clicked.connect(self._apply_global_to_all)
-        import_layout.addWidget(apply_btn)
-        settings_splitter.addWidget(import_box)
+        # ── Sticky footer: Proceed is always visible bottom-right ─────── #
+        root.addWidget(self._build_footer())
 
-        corr_box = QGroupBox("Corrections & QC (Applies to active preview)") 
-        corr_layout = QVBoxLayout(corr_box)
-        
-        qc_row = QHBoxLayout()
-        qc_row.addWidget(QLabel("QC Win:"))
-        qc_row.addWidget(self._info_btn("Size of the rolling window (number of data points) used to calculate the moving median baseline.", "QC Window"))
-        self._qc_win = QLineEdit("20")
-        self._qc_win.setFixedWidth(30)
-        qc_row.addWidget(self._qc_win)
-        
-        qc_row.addWidget(QLabel("Std:"))
-        qc_row.addWidget(self._info_btn("How many standard deviations away from the baseline a point must be to be flagged as a spike.", "QC Threshold"))
-        self._qc_thresh = QLineEdit("3.0")
-        self._qc_thresh.setFixedWidth(30)
-        qc_row.addWidget(self._qc_thresh)
-        
-        self._qc_action = QComboBox()
-        self._qc_action.addItems(["Replace with NA", "Replace with Mean"])
-        qc_row.addWidget(self._qc_action)
-        qc_row.addWidget(self._info_btn("What to do with identified spikes or negative values.", "QC Action"))
-        
-        qc_btn = QPushButton("Run QC")
-        qc_btn.clicked.connect(self._run_qc)
-        qc_row.addWidget(qc_btn)
-        corr_layout.addLayout(qc_row)
+    # ── Files area (add/clear + list + preview), always visible ───────── #
+    def _build_files_area(self) -> QWidget:
+        container = QWidget()
+        container.setObjectName("FilesPane")
+        container.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        body = QVBoxLayout(container)
+        body.setContentsMargins(SPACE_MD, SPACE_SM, SPACE_MD, SPACE_SM)
+        body.setSpacing(SPACE_SM)
 
-        thresh_row = QHBoxLayout()                                                                                       
-        thresh_row.addWidget(QLabel("Min Floor:"))                                                                       
-        self._floor_thresh = QLineEdit("1.0")                                                                            
-        self._floor_thresh.setFixedWidth(40)                                                                             
-        thresh_row.addWidget(self._floor_thresh)                                                                         
+        files_title = QLabel("Files")
+        files_title.setObjectName("H2")
+        body.addWidget(files_title)
 
-        btn_floor = QPushButton("Apply Floor")                                                                           
-        btn_floor.clicked.connect(self._run_floor_threshold)                                                             
-        thresh_row.addWidget(btn_floor)                                                                                  
-        
-        floor_info = ("MPSS instruments cannot reliably measure < 1 particle/cm3.\n"                                     
-                      "Values below this are often non-physical. Low values are sometimes also used as error flags.\n"
-                      "This tool replaces all values below your threshold with the threshold.")
-        thresh_row.addWidget(self._info_btn(floor_info, "Minimum Floor Threshold"))                                      
-
-        thresh_row.addWidget(QLabel("Max Ceiling:")) 
-        self._ceil_thresh = QLineEdit("1e6") 
-        self._ceil_thresh.setFixedWidth(40) 
-        thresh_row.addWidget(self._ceil_thresh) 
-        
-        btn_ceil = QPushButton("Apply Ceiling") 
-        btn_ceil.clicked.connect(self._run_ceil_threshold) 
-        thresh_row.addWidget(btn_ceil) 
-        
-        thresh_row.addStretch()                                                                                          
-        corr_layout.addLayout(thresh_row)                                                                                
-        
-        ll_row = QHBoxLayout()
-        ll_row.addWidget(QLabel("L(m):"))
-        self._ll_len = QLineEdit("2.0")
-        self._ll_len.setFixedWidth(30)
-        ll_row.addWidget(self._ll_len)
-        ll_row.addWidget(QLabel("ID(m):"))
-        self._ll_id = QLineEdit("0.006")
-        self._ll_id.setFixedWidth(40)
-        ll_row.addWidget(self._ll_id)
-        ll_row.addWidget(QLabel("T(K):"))
-        self._ll_temp = QLineEdit("293")
-        self._ll_temp.setFixedWidth(35)
-        ll_row.addWidget(self._ll_temp)
-        ll_row.addWidget(QLabel("Q(LPM):"))
-        self._ll_flow = QLineEdit("1.0")
-        self._ll_flow.setFixedWidth(30)
-        ll_row.addWidget(self._ll_flow)
-        
-        ll_btn = QPushButton("Line Loss Correct")
-        ll_btn.clicked.connect(self._run_line_loss)
-        ll_row.addWidget(ll_btn)
-        ll_row.addWidget(self._info_btn("Applies Gormley-Kennedy diffusional loss corrections to the active dataset.", "Line Loss Correction"))
-        corr_layout.addLayout(ll_row)
-        
-        norm_row = QHBoxLayout()
-        norm_row.addWidget(QLabel("dlogDp:"))
-        norm_row.addWidget(self._info_btn("The calculated logarithmic width of your diameter bins. Required to normalise between dN and dN/dlogDp. n.b., the subsequent calculations will anticipate that your values are in dNdlogdp", "dlogDp Normalisation"))
-        self._norm_dlogdp = QLineEdit("1.0")
-        self._norm_dlogdp.setFixedWidth(50)
-        norm_row.addWidget(self._norm_dlogdp)
-        
-        btn_norm = QPushButton("Normalise")
-        btn_norm.clicked.connect(self._run_normalise)
-        norm_row.addWidget(btn_norm)
-        
-        btn_unnorm = QPushButton("Un-normalise")
-        btn_unnorm.clicked.connect(self._run_unnormalise)
-        norm_row.addWidget(btn_unnorm)
-        corr_layout.addLayout(norm_row)
-        
-        dt_row = QHBoxLayout()
-        dt_btn = QPushButton("⏰ Filter by Date/Time")
-        dt_btn.clicked.connect(self._run_datetime_filter)
-        dt_row.addWidget(dt_btn)
-        dp_btn = QPushButton("📏 Filter Diameters")
-        dp_btn.clicked.connect(self._run_diameter_filter)
-        dt_row.addWidget(dp_btn)
-        dt_row.addWidget(self._info_btn("Filter data by custom date range, day of week, month, hour of day, or year.", "Date/Time Filter"))
-        dt_row.addStretch()
-        corr_layout.addLayout(dt_row)
-        
-        settings_splitter.addWidget(corr_box)
-        root.addWidget(settings_splitter)
-
-        file_row = QHBoxLayout() 
+        file_row = QHBoxLayout()
         add_btn = QPushButton("+ Add files…")
+        add_btn.setProperty("class", "secondary")
         add_btn.clicked.connect(self._browse_files)
         file_row.addWidget(add_btn)
         clear_btn = QPushButton("Clear all")
+        clear_btn.setProperty("class", "destructive")
         clear_btn.clicked.connect(self._clear_all)
         file_row.addWidget(clear_btn)
-        root.addLayout(file_row)
+        file_row.addStretch()
+        body.addLayout(file_row)
 
         list_splitter = QSplitter(Qt.Orientation.Vertical)
-        
+
         self._file_list_inner = QWidget()
         self._file_list_layout = QVBoxLayout(self._file_list_inner)
         self._file_list_layout.addStretch()
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(self._file_list_inner)
+        scroll.setMinimumHeight(110)
         list_splitter.addWidget(scroll)
-        
+
         preview_container = QWidget()
         preview_layout = QVBoxLayout(preview_container)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
         self._preview_hint = QLabel("Preview")
+        self._preview_hint.setObjectName("Hint")
         preview_layout.addWidget(self._preview_hint)
         self._preview_table = QTableWidget()
         self._preview_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._preview_table.setMinimumHeight(130)
         preview_layout.addWidget(self._preview_table)
         list_splitter.addWidget(preview_container)
-        
-        list_splitter.setSizes([600, 200])   
-        list_splitter.setStretchFactor(0, 1) 
-        list_splitter.setStretchFactor(1, 0) 
-        root.addWidget(list_splitter, stretch=1)
-        action_row = QHBoxLayout() 
-        
-        self.merge_append_btn = QPushButton("Simple Append (Keep Bins)")
-        self.merge_append_btn.setStyleSheet("font-weight: bold; background-color: #e2d5cb;")
+
+        list_splitter.setSizes([320, 260])
+        list_splitter.setStretchFactor(0, 1)
+        list_splitter.setStretchFactor(1, 1)
+        body.addWidget(list_splitter, stretch=1)
+
+        return container
+
+    # ── Section 1 · Import settings ──────────────────────────────────── #
+    def _build_import_section(self) -> CollapsibleSection:
+        sec = CollapsibleSection("1 · Import settings")
+        body = QVBoxLayout()
+        form = make_form()
+
+        self._col_combo = QComboBox()
+        self._col_combo.addItems(DATE_COLUMN_OPTIONS)
+        self._col_combo.setMinimumWidth(FIELD_MIN_WIDTH)
+        self._col_combo.currentTextChanged.connect(self._on_col_changed)
+        self._custom_col = QLineEdit()
+        self._custom_col.setPlaceholderText("Enter custom column name…")
+        self._custom_col.setVisible(False)
+        form.addRow("Date column", self._field_row(
+            self._col_combo, self._custom_col,
+            self._info_btn("The exact name of the column in your CSV containing the timestamp.", "Date Column")))
+
+        self._fmt_combo = QComboBox()
+        self._fmt_combo.setMinimumWidth(FIELD_MIN_WIDTH)
+        sorted_fmts = sorted(DATE_FORMAT_OPTIONS, key=lambda x: 0 if str(x[0]).upper().startswith('Y') else (1 if str(x[0]).upper().startswith('D') else 2))
+        for disp, _ in sorted_fmts: self._fmt_combo.addItem(disp)
+        self._fmt_combo.currentIndexChanged.connect(self._on_fmt_changed)
+        self._custom_fmt = QLineEdit()
+        self._custom_fmt.setPlaceholderText("e.g., yyyy/MM/dd HH:mm:ss")
+        self._custom_fmt.setVisible(False)
+        form.addRow("Date format", self._field_row(
+            self._fmt_combo, self._custom_fmt,
+            self._info_btn("The structural format of your dates. Use 'Custom...' if none match perfectly.", "Date Format")))
+
+        self._tz_input = QLineEdit("UTC")
+        self._tz_input.setMinimumWidth(FIELD_MIN_WIDTH)
+        form.addRow("Timezone", self._field_row(
+            self._tz_input,
+            self._info_btn("Standardises your data to a specific timezone (e.g., 'UTC', 'Europe/London'). Protects against DST gaps.", "Timezone")))
+
+        self._resample_val = QLineEdit()
+        self._resample_val.setPlaceholderText("Value")
+        self._resample_val.setMinimumWidth(NARROW_FIELD_MIN_WIDTH)
+        self._resample_unit = QComboBox()
+        self._resample_unit.addItems(["Minutes", "Hours", "Days"])
+        form.addRow("Average to timebase", self._field_row(
+            self._resample_val, self._resample_unit,
+            self._info_btn("Optional: Average your data to a new timebase (e.g., enter '15' and select 'Minutes' to downsample).", "Timebase Averaging")))
+
+        self._na_combo = QComboBox()
+        self._na_combo.setMinimumWidth(FIELD_MIN_WIDTH)
+        self._na_combo.addItems(["Drop Rows", "Fill (Fwd/Bwd)", "Interpolate", "Fill Min (1e0)"])
+        form.addRow("Missing data", self._field_row(
+            self._na_combo,
+            self._info_btn("How to handle missing data.\nDrop: Removes the row.\nFill: Copies last valid value.\nInterpolate: Draws a line.\nFill Min: Replaces with 1e0.", "Missing Data Handling")))
+
+        self._drop_cols = QLineEdit()
+        self._drop_cols.setPlaceholderText("Comma separated…")
+        self._drop_cols.setMinimumWidth(FIELD_MIN_WIDTH)
+        form.addRow("Drop columns", self._field_row(
+            self._drop_cols,
+            self._info_btn("Comma-separated list of columns to ignore completely (e.g., 'Status, Error Code').", "Drop Columns")))
+
+        self._flag_col = QLineEdit()
+        self._flag_col.setPlaceholderText("e.g., flag")
+        self._flag_col.setMinimumWidth(FIELD_MIN_WIDTH)
+        self._flag_val = QLineEdit("1")
+        self._flag_val.setMaximumWidth(NARROW_FIELD_MIN_WIDTH)
+        form.addRow("Error flag column", self._field_row(
+            self._flag_col, QLabel("Error value"), self._flag_val,
+            self._info_btn(
+                "Optional: name of a 'flag' column in your CSV.\n"
+                "Rows where that column equals the Error Value will be deleted before any other processing.\n"
+                "Leave blank to skip. Default error value is 1 (e.g. 0 = clean, 1 = flagged).",
+                "Error Flag Filtering")))
+
+        body.addLayout(form)
+
+        apply_btn = QPushButton("Apply to all loaded files")
+        apply_btn.setProperty("class", "secondary")
+        apply_btn.clicked.connect(self._apply_global_to_all)
+        apply_row = QHBoxLayout()
+        apply_row.addStretch()
+        apply_row.addWidget(apply_btn)
+        body.addLayout(apply_row)
+
+        sec.set_content_layout(body)
+        return sec
+
+    # ── Section 2 · Corrections & QC ─────────────────────────────────── #
+    def _build_corrections_section(self) -> CollapsibleSection:
+        sec = CollapsibleSection("2 · Corrections & QC", expanded=False)
+        body = QVBoxLayout()
+        body.setSpacing(SPACE_MD)
+
+        # --- QC spike removal ---
+        qc_box = QGroupBox("QC spike removal")
+        qc_form = make_form()
+        self._qc_win = QLineEdit("20")
+        self._qc_win.setMaximumWidth(NARROW_FIELD_MIN_WIDTH)
+        qc_form.addRow("QC window (points)", self._field_row(
+            self._qc_win,
+            self._info_btn("Size of the rolling window (number of data points) used to calculate the moving median baseline.", "QC Window")))
+        self._qc_thresh = QLineEdit("3.0")
+        self._qc_thresh.setMaximumWidth(NARROW_FIELD_MIN_WIDTH)
+        qc_form.addRow("Threshold (std dev)", self._field_row(
+            self._qc_thresh,
+            self._info_btn("How many standard deviations away from the baseline a point must be to be flagged as a spike.", "QC Threshold")))
+        self._qc_action = QComboBox()
+        self._qc_action.setMinimumWidth(FIELD_MIN_WIDTH)
+        self._qc_action.addItems(["Replace with NA", "Replace with Mean"])
+        qc_form.addRow("Action on spikes", self._field_row(
+            self._qc_action,
+            self._info_btn("What to do with identified spikes or negative values.", "QC Action")))
+        qc_box_layout = QVBoxLayout(qc_box)
+        qc_box_layout.addLayout(qc_form)
+        qc_btn = QPushButton("Run QC")
+        qc_btn.clicked.connect(self._run_qc)
+        qc_btn_row = QHBoxLayout(); qc_btn_row.addStretch(); qc_btn_row.addWidget(qc_btn)
+        qc_box_layout.addLayout(qc_btn_row)
+        body.addWidget(qc_box)
+
+        # --- Floor & ceiling ---
+        thresh_box = QGroupBox("Floor & ceiling")
+        thresh_layout = QHBoxLayout(thresh_box)
+        thresh_layout.addWidget(QLabel("Minimum floor"))
+        self._floor_thresh = QLineEdit("1.0")
+        self._floor_thresh.setMaximumWidth(NARROW_FIELD_MIN_WIDTH)
+        thresh_layout.addWidget(self._floor_thresh)
+        btn_floor = QPushButton("Apply floor")
+        btn_floor.clicked.connect(self._run_floor_threshold)
+        thresh_layout.addWidget(btn_floor)
+        floor_info = ("MPSS instruments cannot reliably measure < 1 particle/cm3.\n"
+                      "Values below this are often non-physical. Low values are sometimes also used as error flags.\n"
+                      "This tool replaces all values below your threshold with the threshold.")
+        thresh_layout.addWidget(self._info_btn(floor_info, "Minimum Floor Threshold"))
+        thresh_layout.addSpacing(SPACE_LG)
+        thresh_layout.addWidget(QLabel("Maximum ceiling"))
+        self._ceil_thresh = QLineEdit("1e6")
+        self._ceil_thresh.setMaximumWidth(NARROW_FIELD_MIN_WIDTH)
+        thresh_layout.addWidget(self._ceil_thresh)
+        btn_ceil = QPushButton("Apply ceiling")
+        btn_ceil.clicked.connect(self._run_ceil_threshold)
+        thresh_layout.addWidget(btn_ceil)
+        thresh_layout.addStretch()
+        body.addWidget(thresh_box)
+
+        # --- Line loss (Gormley-Kennedy) ---
+        ll_box = QGroupBox("Line loss (Gormley-Kennedy)")
+        ll_outer = QVBoxLayout(ll_box)
+        ll_form = make_form()
+        self._ll_len = QLineEdit("2.0")
+        self._ll_len.setMaximumWidth(NARROW_FIELD_MIN_WIDTH)
+        ll_form.addRow("Tube length (m)", self._ll_len)
+        self._ll_id = QLineEdit("0.006")
+        self._ll_id.setMaximumWidth(NARROW_FIELD_MIN_WIDTH)
+        ll_form.addRow("Inner diameter (m)", self._ll_id)
+        self._ll_temp = QLineEdit("293")
+        self._ll_temp.setMaximumWidth(NARROW_FIELD_MIN_WIDTH)
+        ll_form.addRow("Temperature (K)", self._ll_temp)
+        self._ll_flow = QLineEdit("1.0")
+        self._ll_flow.setMaximumWidth(NARROW_FIELD_MIN_WIDTH)
+        ll_form.addRow("Flow (LPM)", self._ll_flow)
+        ll_outer.addLayout(ll_form)
+        ll_btn = QPushButton("Line loss correct")
+        ll_btn.clicked.connect(self._run_line_loss)
+        ll_btn_row = QHBoxLayout(); ll_btn_row.addStretch()
+        ll_btn_row.addWidget(ll_btn)
+        ll_btn_row.addWidget(self._info_btn("Applies Gormley-Kennedy diffusional loss corrections to the active dataset.", "Line Loss Correction"))
+        ll_outer.addLayout(ll_btn_row)
+        body.addWidget(ll_box)
+
+        # --- Normalisation ---
+        norm_box = QGroupBox("Normalisation")
+        norm_layout = QHBoxLayout(norm_box)
+        norm_layout.addWidget(QLabel("dlogDp bin width"))
+        self._norm_dlogdp = QLineEdit("1.0")
+        self._norm_dlogdp.setMaximumWidth(NARROW_FIELD_MIN_WIDTH)
+        norm_layout.addWidget(self._norm_dlogdp)
+        norm_layout.addWidget(self._info_btn("The calculated logarithmic width of your diameter bins. Required to normalise between dN and dN/dlogDp. n.b., the subsequent calculations will anticipate that your values are in dNdlogdp", "dlogDp Normalisation"))
+        btn_norm = QPushButton("Normalise")
+        btn_norm.clicked.connect(self._run_normalise)
+        norm_layout.addWidget(btn_norm)
+        btn_unnorm = QPushButton("Un-normalise")
+        btn_unnorm.clicked.connect(self._run_unnormalise)
+        norm_layout.addWidget(btn_unnorm)
+        norm_layout.addStretch()
+        body.addWidget(norm_box)
+
+        # --- Filters ---
+        filt_box = QGroupBox("Filters")
+        filt_layout = QHBoxLayout(filt_box)
+        dt_btn = QPushButton("⏰ Filter by date/time")
+        dt_btn.clicked.connect(self._run_datetime_filter)
+        filt_layout.addWidget(dt_btn)
+        dp_btn = QPushButton("📏 Filter diameters")
+        dp_btn.clicked.connect(self._run_diameter_filter)
+        filt_layout.addWidget(dp_btn)
+        filt_layout.addWidget(self._info_btn("Filter data by custom date range, day of week, month, hour of day, or year.", "Date/Time Filter"))
+        filt_layout.addStretch()
+        body.addWidget(filt_box)
+
+        sec.set_content_layout(body)
+        return sec
+
+    # ── Section 3 · Combine & proceed ────────────────────────────────── #
+    def _build_combine_section(self) -> CollapsibleSection:
+        sec = CollapsibleSection("3 · Combine & proceed")
+        body = QVBoxLayout()
+        body.setSpacing(SPACE_MD)
+
+        combine_box = QGroupBox("Combine files")
+        combine_layout = QVBoxLayout(combine_box)
+        merge_row = QHBoxLayout()
+
+        self.merge_append_btn = QPushButton("Simple append (keep bins)")
+        self.merge_append_btn.setProperty("class", "secondary")
         self.merge_append_btn.setEnabled(False)
         self.merge_append_btn.clicked.connect(lambda: self._execute_merge(mode="append"))
-        action_row.addWidget(self.merge_append_btn)
-        action_row.addWidget(self._info_btn("Appends selected files as they are. Missing bins will become NAs. Used for when you have multiple .csv files from the same instrument but different times", "Simple Append"))
-        
-        self.merge_splice_btn = QPushButton("Splice Datasets (Align Bins)")
-        self.merge_splice_btn.setStyleSheet("font-weight: bold; background-color: #d1c4ba;")
+        merge_row.addWidget(self.merge_append_btn)
+        merge_row.addWidget(self._info_btn("Appends selected files as they are. Missing bins will become NAs. Used for when you have multiple .csv files from the same instrument but different times", "Simple Append"))
+
+        self.merge_splice_btn = QPushButton("Splice datasets (align bins)")
+        self.merge_splice_btn.setProperty("class", "secondary")
         self.merge_splice_btn.setEnabled(False)
         self.merge_splice_btn.clicked.connect(lambda: self._execute_merge(mode="splice"))
-        action_row.addWidget(self.merge_splice_btn)
-        action_row.addWidget(self._info_btn("Joins two datasets with overlapping times, but different bins. Used to, for example, merge NanoSMPS and LongSMPS data.", "Splice Datasets"))
-        
-        self.harmonise_btn = QPushButton("Harmonise Dp") 
-        self.harmonise_btn.setStyleSheet("font-weight: bold; background-color: #c4d1ba;") 
-        self.harmonise_btn.setEnabled(False) 
-        self.harmonise_btn.clicked.connect(self._run_harmonise) 
-        action_row.addWidget(self.harmonise_btn) 
-        action_row.addWidget(self._info_btn("Interpolates selected datasets onto a common set of diameters via cubic splines.", "Harmonise Dp")) 
-        
-        save_btn = QPushButton("Export Active Datafile to CSV")
+        merge_row.addWidget(self.merge_splice_btn)
+        merge_row.addWidget(self._info_btn("Joins two datasets with overlapping times, but different bins. Used to, for example, merge NanoSMPS and LongSMPS data.", "Splice Datasets"))
+
+        self.harmonise_btn = QPushButton("Harmonise Dp")
+        self.harmonise_btn.setProperty("class", "secondary")
+        self.harmonise_btn.setEnabled(False)
+        self.harmonise_btn.clicked.connect(self._run_harmonise)
+        merge_row.addWidget(self.harmonise_btn)
+        merge_row.addWidget(self._info_btn("Interpolates selected datasets onto a common set of diameters via cubic splines.", "Harmonise Dp"))
+        merge_row.addStretch()
+        combine_layout.addLayout(merge_row)
+
+        self._merge_hint = QLabel("Select 2 or more valid files (Ctrl-click in the list) to enable merging.")
+        self._merge_hint.setObjectName("Hint")
+        combine_layout.addWidget(self._merge_hint)
+        body.addWidget(combine_box)
+
+        export_row = QHBoxLayout()
+        save_btn = QPushButton("Export active datafile to CSV")
+        save_btn.setProperty("class", "secondary")
         save_btn.clicked.connect(self._export_csv)
-        action_row.addWidget(save_btn)
-        action_row.addStretch()
-        
-        self._confirm_btn = QPushButton("📊 Proceed with selected dataframe  →")
-        self._confirm_btn.setStyleSheet("font-size: 16pt; font-weight: bold;") 
-        self._confirm_btn.clicked.connect(self._confirm)
-        action_row.addWidget(self._confirm_btn)
-        root.addLayout(action_row)
-        
+        export_row.addWidget(save_btn)
+        export_row.addStretch()
+        body.addLayout(export_row)
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
-        root.addWidget(self.progress_bar)
+        body.addWidget(self.progress_bar)
+
+        sec.set_content_layout(body)
+        return sec
+
+    # ── Sticky footer: the primary action, always pinned bottom-right ─── #
+    def _build_footer(self) -> QWidget:
+        container = QWidget()
+        footer = QHBoxLayout(container)
+        footer.setContentsMargins(SPACE_MD, SPACE_SM, SPACE_MD, 0)
+        footer.addStretch()
+        self._confirm_btn = QPushButton("📊  Proceed with selected dataset  →")
+        self._confirm_btn.setProperty("class", "primary")
+        self._confirm_btn.clicked.connect(self._confirm)
+        footer.addWidget(self._confirm_btn)
+        return container
+
+    def _refresh_editing_label(self):
+        if self._active_preview_path:
+            self._editing_lbl.setText(f"Editing: {Path(self._active_preview_path).name}")
+        else:
+            self._editing_lbl.setText("Editing: —")
 
     def _on_col_changed(self, text):
         self._custom_col.setVisible(text == "Custom...")
@@ -867,9 +966,9 @@ class LoadPanel(QWidget):
                 f"{body}</body></html>"
             )
             info_icon = _PreviewIconLabel(tooltip_html)                                  # Create icon
+            info_icon.setObjectName("PreviewIcon")                                       # Style via QSS
             info_icon.setFixedSize(24, 24)                                               # Size icon
             info_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)                         # Centre icon
-            info_icon.setStyleSheet("background-color: #d1c4ba; border-radius: 4px;")    # Style icon
             info_icon.setCursor(Qt.CursorShape.PointingHandCursor)                       # Add pointer cursor
             
             row_layout.addWidget(info_icon)                                              # Pack icon
@@ -963,6 +1062,7 @@ class LoadPanel(QWidget):
         else:
             self._preview_table.clear()
             self._preview_hint.setText("No file selected.")
+            self._refresh_editing_label()
         self._update_merge_buttons()
 
     def _remove_file(self, path: str):
@@ -972,9 +1072,10 @@ class LoadPanel(QWidget):
             else: entry.deleteLater()
         self._results.pop(path, None)
         if path in self._selected_paths: self._selected_paths.remove(path)
-        if self._active_preview_path == path: 
+        if self._active_preview_path == path:
             self._preview_table.clear()
             self._active_preview_path = None
+            self._refresh_editing_label()
         self._update_merge_buttons()
 
     def _clear_all(self):
@@ -1020,7 +1121,9 @@ class LoadPanel(QWidget):
             can_merge = valid_total >= 2
         self.merge_append_btn.setEnabled(can_merge)
         self.merge_splice_btn.setEnabled(can_merge)
-        self.harmonise_btn.setEnabled(can_merge) 
+        self.harmonise_btn.setEnabled(can_merge)
+        if hasattr(self, "_merge_hint"):
+            self._merge_hint.setVisible(not can_merge)
 
     def _run_harmonise(self): 
         """Harmonises datasets onto a common target bin set using cubic splines."""
@@ -1321,6 +1424,7 @@ class LoadPanel(QWidget):
         if path: df.to_csv(path)
 
     def _populate_preview(self, df: pd.DataFrame | None, diams: list, title: str):
+        self._refresh_editing_label()
         if df is None:
             self._preview_hint.setText(title)
             self._preview_table.clear()
