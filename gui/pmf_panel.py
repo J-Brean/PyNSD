@@ -3,6 +3,7 @@ import shutil                                                            # For c
 import subprocess                                                        # For running external .exe
 import copy                                                              # For copying colormaps
 import re                                                                # For parsing the Fortran LOG files
+import json                                                              # For reading/writing archive metadata
 import pandas as pd                                                      # For data handling
 import numpy as np                                                       # For maths operations
 import matplotlib.pyplot as plt                                          # Global Matplotlib import
@@ -107,6 +108,42 @@ class RenameDialog(QDialog):
             custom = self.table.item(i, 1).text()                        
             self.factor_names[raw] = custom                              
         self.accept()                                                    
+
+class CombineFactorsDialog(QDialog):
+    def __init__(self, panel, parent=None):
+        super().__init__(parent)
+        self.panel = panel
+        self.selected = None                                             # (idx_a, idx_b) on accept
+        self.setWindowTitle("Combine Factors")
+        self.setMinimumWidth(340)
+        layout = QVBoxLayout(self)
+
+        info = QLabel("Select two factors to merge. Their G (time) and\n"
+                      "F (profile) columns are summed into one factor.")
+        layout.addWidget(info)
+
+        row = QHBoxLayout()
+        self.cb_a = QComboBox(); self.cb_b = QComboBox()
+        for i in range(panel.current_factors):
+            name = panel._get_factor_name(i)
+            self.cb_a.addItem(name, i); self.cb_b.addItem(name, i)
+        if panel.current_factors > 1:
+            self.cb_b.setCurrentIndex(1)                                 # Default to a different pair
+        row.addWidget(self.cb_a); row.addWidget(QLabel("+")); row.addWidget(self.cb_b)
+        layout.addLayout(row)
+
+        btn = QPushButton("Combine")
+        btn.setStyleSheet("background-color: #4CAF50; color: white;")
+        btn.clicked.connect(self._apply)
+        layout.addWidget(btn)
+
+    def _apply(self):
+        a = self.cb_a.currentData(); b = self.cb_b.currentData()
+        if a == b:
+            QMessageBox.warning(self, "Invalid", "Please select two different factors.")
+            return
+        self.selected = (a, b)
+        self.accept()
 
 class TabbedVisualizer(QDialog):
     def __init__(self, panel, parent=None):
@@ -633,13 +670,13 @@ class PMFPanel(QWidget):
         
         settings_layout.addWidget(QLabel("FPEAK Min:"), 0, 3)            
         self.spin_fpeak_min = QDoubleSpinBox()                           
-        self.spin_fpeak_min.setRange(-2.0, 2.0); self.spin_fpeak_min.setValue(-1.0) 
+        self.spin_fpeak_min.setRange(-10.0, 10.0); self.spin_fpeak_min.setValue(-1.0)
         self.spin_fpeak_min.setToolTip("Step 5: Define the lower boundary for rotational ambiguity testing.")
         settings_layout.addWidget(self.spin_fpeak_min, 0, 4)             
         
         settings_layout.addWidget(QLabel("FPEAK Max:"), 1, 3)            
         self.spin_fpeak_max = QDoubleSpinBox()                           
-        self.spin_fpeak_max.setRange(-2.0, 2.0); self.spin_fpeak_max.setValue(1.0) 
+        self.spin_fpeak_max.setRange(-10.0, 10.0); self.spin_fpeak_max.setValue(1.0) 
         self.spin_fpeak_max.setToolTip("Step 5: Define the upper boundary for rotational ambiguity testing.")
         settings_layout.addWidget(self.spin_fpeak_max, 1, 4)             
         
@@ -688,7 +725,11 @@ class PMFPanel(QWidget):
         btn_opt.clicked.connect(self.optimize_coefficients)                      # Link
         btn_rename = QPushButton("3. Rename Factors")                            # Button 3
         btn_rename.clicked.connect(self.open_renamer)                            # Link
-        
+
+        btn_combine = QPushButton("Combine Factors")                             # Merge two factors
+        btn_combine.setStyleSheet("background-color: #673AB7; color: white;")    # Purple style
+        btn_combine.clicked.connect(self.combine_factors)                        # Link logic
+
         btn_archive = QPushButton("4. Archive to Library")                       # New Archive Button
         btn_archive.setStyleSheet("background-color: #009688; color: white;")    # Teal style
         btn_archive.clicked.connect(self.save_current_model)                     # Link logic
@@ -697,8 +738,8 @@ class PMFPanel(QWidget):
         btn_load_lib.setStyleSheet("background-color: #795548; color: white;")   # Brown style
         btn_load_lib.clicked.connect(self.load_from_library)                     # Link logic
         
-        for b in [btn_vis, btn_opt, btn_rename, btn_archive, btn_load_lib]: 
-            action_layout.addWidget(b)                                           # Add all to layout        
+        for b in [btn_vis, btn_opt, btn_rename, btn_combine, btn_archive, btn_load_lib]:
+            action_layout.addWidget(b)                                           # Add all to layout
         action_layout.addWidget(btn_vis)                                                 # Existing
         action_layout.addWidget(btn_opt)                                                 # Existing
         action_layout.addWidget(btn_rename)                                              # Existing
@@ -1001,88 +1042,163 @@ class PMFPanel(QWidget):
         dialog = RenameDialog(self.current_factors, self.factor_names, self)
         dialog.exec()
 
+    def combine_factors(self):
+        if self.f_matrix is None or self.g_matrix is None:
+            return QMessageBox.warning(self, "No Model Active", "Please select a run from the dropdown first.")
+        if self.current_factors < 2:
+            return QMessageBox.warning(self, "Error", "Need at least two factors to combine.")
+
+        dialog = CombineFactorsDialog(self, self)
+        if not dialog.exec() or dialog.selected is None:
+            return
+        idx_a, idx_b = dialog.selected
+        lo, hi = sorted([idx_a, idx_b])                                          # Merged factor takes the lower slot
+
+        combined_f = self.f_matrix.iloc[:, idx_a].values + self.f_matrix.iloc[:, idx_b].values
+        combined_g = self.g_matrix.iloc[:, idx_a].values + self.g_matrix.iloc[:, idx_b].values
+        combined_name = f"{self._get_factor_name(idx_a)}+{self._get_factor_name(idx_b)}"
+
+        # Rebuild F, G and names positionally: drop the higher slot, sum into the lower one,
+        # keep every other factor (and its current name) in order.
+        f_cols, g_cols, names = [], [], {}
+        pos = 0
+        for i in range(self.current_factors):
+            if i == hi:
+                continue
+            if i == lo:
+                f_cols.append(combined_f); g_cols.append(combined_g); label = combined_name
+            else:
+                f_cols.append(self.f_matrix.iloc[:, i].values)
+                g_cols.append(self.g_matrix.iloc[:, i].values)
+                label = self._get_factor_name(i)
+            names[f"Factor {pos + 1}"] = label
+            pos += 1
+
+        self.f_matrix = pd.DataFrame(np.column_stack(f_cols), index=self.f_matrix.index)
+        self.g_matrix = pd.DataFrame(np.column_stack(g_cols), index=self.g_matrix.index)
+        self.current_factors -= 1
+        self.factor_names = names
+
+        self.lbl_fpeak.setText(f"Active Data (COMBINED): {self.current_factors} factors")
+        QMessageBox.information(self, "Factors Combined",
+            f"Merged into '{combined_name}'.\nModel now has {self.current_factors} factors.\n\n"
+            "This is an in-memory edit. Re-selecting a run from the dropdown reloads the original solution.")
+
     def _get_factor_name(self, col_idx):
         raw_name = f"Factor {col_idx + 1}"                               
         return self.factor_names.get(raw_name, raw_name)
 
     def save_current_model(self):
-        if self.f_matrix is None:
+        if self.f_matrix is None or self.g_matrix is None:
             return QMessageBox.warning(self, "Error", "Nothing to save. Select a model first.")
-        
+
         name, ok = QInputDialog.getText(self, "Archive Model", "Name this solution:")
         if not (ok and name): return
-        
-        archive_dir = os.path.join(self.working_dir, "saved_library", name)
+
+        safe_name = re.sub(r'[<>:"/\\|?*]', '_', name).strip(' .')                       # Strip path-hostile chars
+        if not safe_name:
+            return QMessageBox.warning(self, "Invalid Name", "Please enter a usable name.")
+
+        library_root = os.path.join(self.working_dir, "saved_library") if self.working_dir else "saved_library"
+        archive_dir = os.path.join(library_root, safe_name)
+
+        if os.path.isdir(archive_dir) and os.listdir(archive_dir):                       # Confirm before clobbering
+            reply = QMessageBox.question(self, "Overwrite?",
+                f"An archive named '{safe_name}' already exists. Overwrite it?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply != QMessageBox.StandardButton.Yes: return
         os.makedirs(archive_dir, exist_ok=True)
-        
-        # Convert DatetimeIndex to string list for JSON storage
-        ts_list = self.g_matrix.index.strftime('%Y-%m-%d %H:%M:%S').tolist()            # Capture timestamps
 
         try:
-            fpeak_str = self.combo_fpeak.currentText().split("FPEAK:")[1].split(",")[0].strip()
-        except:
-            fpeak_str = str(self.current_fpeak)
+            # Persist the in-memory matrices (the source of truth) with their own indices,
+            # so combined/optimised solutions are saved exactly as displayed.
+            self.f_matrix.to_csv(os.path.join(archive_dir, "F_matrix.csv"), index_label="Diameter_nm")
+            self.g_matrix.to_csv(os.path.join(archive_dir, "G_matrix.csv"), index_label="Timestamp")
 
-        f_src = os.path.join(self.run_dir, f"F_FACTOR_{self.current_factors}_{fpeak_str}.TXT")
-        g_src = os.path.join(self.run_dir, f"G_FACTOR_{self.current_factors}_{fpeak_str}.TXT")
-        
-        try:
-            shutil.copy(f_src, os.path.join(archive_dir, "F_MATRIX.TXT"))               # Copy profile matrix
-            shutil.copy(g_src, os.path.join(archive_dir, "G_MATRIX.TXT"))               # Copy contribution matrix
-            
-            import json
+            # Best-effort: copy residuals + Q/Qexp so the Diagnostics tab survives a reload.
+            q_ratio = 0.0
+            try:
+                fpeak_str = self.combo_fpeak.currentText().split("FPEAK:")[1].split(",")[0].strip()
+            except Exception:
+                fpeak_str = str(self.current_fpeak)
+            resid_src = os.path.join(self.run_dir, f"ScaledResid_{self.current_factors}_{fpeak_str}.dat") if self.run_dir else ""
+            if resid_src and os.path.exists(resid_src):
+                shutil.copy(resid_src, os.path.join(archive_dir, "ScaledResid.dat"))
+                q_ratio = self._get_q_ratio(self.current_factors, self.current_fpeak,
+                                            len(self.g_matrix), len(self.f_matrix))
+
             meta = {
-                "factors": self.current_factors, 
-                "fpeak": self.current_fpeak, 
-                "names": self.factor_names, 
+                "format": "csv_v2",
+                "factors": self.current_factors,
+                "fpeak": self.current_fpeak,
+                "error_fraction": self.spin_error.value(),
+                "names": self.factor_names,
                 "chk_wide": self.chk_wide_pmf.isChecked(),
-                "diams": list(self.diams) if self.diams is not None else [],            # Save bins
-                "timestamps": ts_list                                                   # Save dates!
+                "diams": [float(d) for d in self.diams] if self.diams is not None else [],
+                "q_ratio": q_ratio,
             }
             with open(os.path.join(archive_dir, "metadata.json"), 'w') as f:
-                json.dump(meta, f)                                                      # Write metadata
-            QMessageBox.information(self, "Success", f"Model archived with timestamps to saved_library/{name}")
+                json.dump(meta, f, indent=2)
+
+            QMessageBox.information(self, "Success", f"Model archived to saved_library/{safe_name}")
         except Exception as e:
             QMessageBox.critical(self, "Save Error", f"Could not archive model: {e}")
 
     def load_from_library(self):
-        library_root = os.path.join(self.working_dir, "saved_library")
+        library_root = os.path.join(self.working_dir, "saved_library") if self.working_dir else "saved_library"
         selected_dir = QFileDialog.getExistingDirectory(self, "Select Archived Model", library_root)
         if not selected_dir: return
-        
+
         try:
-            import json
             with open(os.path.join(selected_dir, "metadata.json"), 'r') as f:
-                meta = json.load(f)                                                     # Load saved settings
-            
-            # 1. Restore UI State, Bins, and Timestamps
+                meta = json.load(f)
+
+            # 1. Restore scalar state
             self.current_factors = meta.get("factors", 0)
             self.current_fpeak = meta.get("fpeak", 0.0)
             self.factor_names = meta.get("names", {})
             self.chk_wide_pmf.setChecked(meta.get("chk_wide", False))
-            self.diams = np.array(meta.get("diams", []))                                # Restore diameter bins
-            
-            ts_list = meta.get("timestamps", [])
-            if ts_list:
-                self.dates = pd.to_datetime(ts_list)                                    # Restore datetime index
-            
-            # 2. Load Matrices
-            f_vals = np.array(open(os.path.join(selected_dir, "F_MATRIX.TXT")).read().replace(',', ' ').split(), dtype=float)
-            g_vals = np.array(open(os.path.join(selected_dir, "G_MATRIX.TXT")).read().replace(',', ' ').split(), dtype=float)
-            
-            self.f_matrix = pd.DataFrame(f_vals.reshape(self.current_factors, -1).T)
-            self.g_matrix = pd.DataFrame(g_vals.reshape(-1, self.current_factors))
-            
-            # 3. Apply Restored Indices
-            if len(self.diams) > 0 and not self.chk_wide_pmf.isChecked():
-                if len(self.f_matrix) == len(self.diams):
-                    self.f_matrix.index = self.diams                                    # Apply diams to F
-            
-            if self.dates is not None and len(self.g_matrix) == len(self.dates):
-                self.g_matrix.index = self.dates                                        # Apply dates to G
-            
+            self.diams = np.array(meta.get("diams", []))
+            if "error_fraction" in meta:
+                self.spin_error.setValue(meta["error_fraction"])
+
+            # 2. Load matrices, supporting both the new CSV format and legacy TXT dumps
+            f_csv = os.path.join(selected_dir, "F_matrix.csv")
+            g_csv = os.path.join(selected_dir, "G_matrix.csv")
+
+            if os.path.exists(f_csv) and os.path.exists(g_csv):
+                self.f_matrix = pd.read_csv(f_csv, index_col=0)
+                self.g_matrix = pd.read_csv(g_csv, index_col=0)
+                self.g_matrix.index = pd.to_datetime(self.g_matrix.index)               # Rehydrate datetimes
+                self.dates = self.g_matrix.index
+                # Restore integer column labels to match freshly-loaded solutions (positional access).
+                self.f_matrix.columns = range(self.f_matrix.shape[1])
+                self.g_matrix.columns = range(self.g_matrix.shape[1])
+                if len(self.diams) == 0 and not self.chk_wide_pmf.isChecked():
+                    self.diams = np.array(self.f_matrix.index, dtype=float)              # Fall back to F index
+            else:
+                ts_list = meta.get("timestamps", [])
+                if ts_list:
+                    self.dates = pd.to_datetime(ts_list)
+                with open(os.path.join(selected_dir, "F_MATRIX.TXT")) as fh:
+                    f_vals = np.array(fh.read().replace(',', ' ').split(), dtype=float)
+                with open(os.path.join(selected_dir, "G_MATRIX.TXT")) as fh:
+                    g_vals = np.array(fh.read().replace(',', ' ').split(), dtype=float)
+                self.f_matrix = pd.DataFrame(f_vals.reshape(self.current_factors, -1).T)
+                self.g_matrix = pd.DataFrame(g_vals.reshape(-1, self.current_factors))
+                if len(self.diams) > 0 and not self.chk_wide_pmf.isChecked() and len(self.f_matrix) == len(self.diams):
+                    self.f_matrix.index = self.diams
+                if self.dates is not None and len(self.g_matrix) == len(self.dates):
+                    self.g_matrix.index = self.dates
+
+            # 3. Best-effort: drop residuals back where the Diagnostics tab looks for them
+            resid_arch = os.path.join(selected_dir, "ScaledResid.dat")
+            if os.path.exists(resid_arch) and self.run_dir:
+                os.makedirs(self.run_dir, exist_ok=True)
+                shutil.copy(resid_arch, os.path.join(self.run_dir, f"ScaledResid_{self.current_factors}_{self.current_fpeak}.dat"))
+
             self.lbl_fpeak.setText(f"Active Data (LIBRARY): {os.path.basename(selected_dir)}")
-            QMessageBox.information(self, "Loaded", "Model restored with full temporal and diameter data.")
-            
+            QMessageBox.information(self, "Loaded", "Model restored from library.")
+
         except Exception as e:
             QMessageBox.critical(self, "Load Error", f"Failed to reconstruct model: {e}")
