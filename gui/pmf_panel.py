@@ -18,10 +18,12 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
                              QMessageBox, QTableWidget, QSpinBox, 
                              QTableWidgetItem, QDialog, QProgressBar, 
                              QApplication, QCheckBox, QTabWidget,
-                             QInputDialog) 
+                             QInputDialog, QListWidget)
 from PyQt6.QtGui import QFont                                            # For monospace fonts
 from PyQt6.QtCore import Qt, QSettings  # Added QSettings back to the import list
 from utils.pmf_ini_generator import generate_pmf_ini                     # External INI generator
+from utils.data_loader import DATE_COLUMN_OPTIONS, DATE_FORMAT_OPTIONS   # Shared datetime parse options
+from utils.tracer_join import build_tracer_frame, align_to_index         # External tracer helpers
 
 class CowProgressDialog(QDialog):
     def __init__(self, total_steps, parent=None):
@@ -73,6 +75,178 @@ class OptimiseProgressDialog(QDialog):
         self.info_label.setText(text)                                    
         self.progress.setValue(step)                                     
         QApplication.processEvents()                                     
+
+class BootstrapProgressDialog(QDialog):
+    def __init__(self, total, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Bootstrap Uncertainty")
+        self.setMinimumWidth(470)
+        self.cancelled = False
+        lay = QVBoxLayout(self)
+        self.info = QLabel("Preparing bootstrap runs...")
+        self.info.setFont(QFont("Courier", 10))
+        self.progress = QProgressBar(); self.progress.setMaximum(total)
+        btn = QPushButton("Cancel"); btn.clicked.connect(self._cancel)
+        lay.addWidget(self.info); lay.addWidget(self.progress); lay.addWidget(btn)
+
+    def _cancel(self):
+        self.cancelled = True
+
+    def update(self, step, total, eta_s, ok_frac):
+        eta = f"{int(eta_s // 60)}m {int(eta_s % 60)}s" if eta_s > 0 else "estimating..."
+        self.info.setText(f"Bootstrap run {step}/{total}\n"
+                          f"Estimated time remaining: {eta}\n"
+                          f"Factor mapping success so far: {ok_frac * 100:.0f}%")
+        self.progress.setValue(step)
+        QApplication.processEvents()
+
+class BootstrapResultsDialog(QDialog):
+    def __init__(self, diams, base_F, F_boot, contrib_boot, names, success_rate, n_used, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Bootstrap Results ({n_used} runs, mapping success {success_rate * 100:.0f}%)")
+        self.resize(1100, 760)
+        self.diams = np.asarray(diams, dtype=float)
+        self.base_F = base_F; self.F_boot = F_boot; self.contrib = contrib_boot; self.names = names
+        lay = QVBoxLayout(self)
+        self.fig = Figure(figsize=(11, 7)); self.canvas = FigureCanvasQTAgg(self.fig)
+        lay.addWidget(self.canvas)
+        btn = QPushButton("Save Figure"); btn.clicked.connect(self._save)
+        lay.addWidget(btn)
+        self._plot()
+
+    def _plot(self):
+        k = len(self.names)
+        self.fig.clear()
+        gs = self.fig.add_gridspec(2, k)
+        for a in range(k):
+            ax = self.fig.add_subplot(gs[0, a])
+            boot = self.F_boot[a]                                        # (n_used, n_variables)
+            lo = np.nanpercentile(boot, 5, axis=0)
+            hi = np.nanpercentile(boot, 95, axis=0)
+            med = np.nanpercentile(boot, 50, axis=0)
+            on_diams = (len(self.diams) == boot.shape[1])
+            x = self.diams if on_diams else np.arange(boot.shape[1])
+            ax.fill_between(x, lo, hi, color='steelblue', alpha=0.3)
+            ax.plot(x, med, color='steelblue', lw=1.5, label='Bootstrap median')
+            ax.plot(x, self.base_F[:, a], color='red', lw=1.2, ls='--', label='Base')
+            if on_diams:
+                ax.set_xscale('log')
+            ax.set_title(self.names[a], fontsize=9)
+            if a == 0:
+                ax.set_ylabel('F (dN/dlogDp)'); ax.legend(fontsize=7)
+
+        axb = self.fig.add_subplot(gs[1, :])
+        axb.boxplot([self.contrib[:, a] for a in range(k)], showfliers=False)
+        axb.set_xticks(range(1, k + 1)); axb.set_xticklabels(self.names, rotation=20)
+        axb.set_ylabel('Mean contribution (cm⁻³)')
+        axb.set_title('Bootstrap distribution of factor mean contribution')
+        self.fig.tight_layout(); self.canvas.draw()
+
+    def _save(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Save Figure", "Bootstrap_Uncertainty.png",
+                                              "PNG (*.png);;PDF (*.pdf)")
+        if path:
+            self.fig.savefig(path, dpi=300, bbox_inches='tight')
+
+class TracerLoadDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Load External Tracers")
+        self.setMinimumWidth(560)
+        self.raw_df = None
+        self.tracer_df = None                                            # Result frame on accept
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Load a co-located gas/met file (NOx, BC, O3, solar radiation, WD, WS, ...).\n"
+                                "It is aligned to the PMF timeline by nearest timestamp when plotted."))
+
+        row1 = QHBoxLayout()
+        self.btn_browse = QPushButton("+ Load Tracer File")
+        self.btn_browse.clicked.connect(self._browse)
+        self.lbl_path = QLabel("No file loaded")
+        row1.addWidget(self.btn_browse); row1.addWidget(self.lbl_path); row1.addStretch()
+        layout.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("Date Col:"))
+        self.date_col = QComboBox(); self.date_col.addItems(DATE_COLUMN_OPTIONS)
+        self.date_col.currentTextChanged.connect(lambda t: self.custom_date.setVisible(t == "Custom..."))
+        row2.addWidget(self.date_col)
+        self.custom_date = QLineEdit(); self.custom_date.setPlaceholderText("Custom date column"); self.custom_date.setVisible(False)
+        row2.addWidget(self.custom_date)
+        row2.addWidget(QLabel("Format:"))
+        self.fmt = QComboBox()
+        for disp, _ in DATE_FORMAT_OPTIONS:
+            self.fmt.addItem(disp)
+        self.fmt.currentIndexChanged.connect(self._on_fmt)
+        row2.addWidget(self.fmt)
+        self.custom_fmt = QLineEdit(); self.custom_fmt.setPlaceholderText("Custom format"); self.custom_fmt.setVisible(False)
+        row2.addWidget(self.custom_fmt)
+        row2.addWidget(QLabel("TZ:"))
+        self.tz = QLineEdit("UTC"); self.tz.setFixedWidth(80)
+        row2.addWidget(self.tz)
+        layout.addLayout(row2)
+
+        layout.addWidget(QLabel("Select tracer columns to keep (Ctrl/Shift for multiple):"))
+        self.col_list = QListWidget()
+        self.col_list.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
+        layout.addWidget(self.col_list)
+
+        btn_ok = QPushButton("Parse & Use Tracers")
+        btn_ok.setStyleSheet("background-color: #4CAF50; color: white;")
+        btn_ok.clicked.connect(self._accept)
+        layout.addWidget(btn_ok)
+
+    def _on_fmt(self, idx):
+        val = next(v for d, v in DATE_FORMAT_OPTIONS if d == self.fmt.itemText(idx))
+        self.custom_fmt.setVisible(val == "custom")
+
+    def _browse(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select Tracer File", "",
+                                              "Data (*.csv *.xlsx *.xls *.txt *.tsv *.dat)")
+        if not path:
+            return
+        try:
+            if path.lower().endswith((".xlsx", ".xls")):
+                raw = pd.read_excel(path, dtype=str)
+            else:
+                raw = pd.read_csv(path, dtype=str)
+        except Exception as exc:
+            QMessageBox.critical(self, "Load Error", f"Failed to read file:\n{exc}")
+            return
+        self.raw_df = raw
+        self.lbl_path.setText(os.path.basename(path))
+        cols = [str(c) for c in raw.columns]
+        self.col_list.clear(); self.col_list.addItems(cols)
+        low = {c.lower(): c for c in cols}
+        for cand in ["date", "datetime", "timestamp", "time"]:             # Guess the datetime column
+            if cand in low:
+                self.date_col.setCurrentText(low[cand] if low[cand] in DATE_COLUMN_OPTIONS else "Custom...")
+                if low[cand] not in DATE_COLUMN_OPTIONS:
+                    self.custom_date.setText(low[cand])
+                break
+
+    def _accept(self):
+        if self.raw_df is None:
+            return QMessageBox.warning(self, "No File", "Load a tracer file first.")
+        date_choice = self.date_col.currentText()
+        date_col = self.custom_date.text().strip() if date_choice == "Custom..." else date_choice
+        match = [c for c in self.raw_df.columns if str(c).strip().lower() == date_col.strip().lower()]
+        if not match:
+            return QMessageBox.warning(self, "Date Column", f"Column '{date_col}' not found in the file.")
+        fmt_val = next(v for d, v in DATE_FORMAT_OPTIONS if d == self.fmt.currentText())
+        date_fmt = self.custom_fmt.text().strip() if fmt_val == "custom" else fmt_val
+        value_cols = [i.text() for i in self.col_list.selectedItems() if i.text() != match[0]]
+        if not value_cols:
+            return QMessageBox.warning(self, "Columns", "Select at least one tracer column.")
+        try:
+            self.tracer_df = build_tracer_frame(self.raw_df, match[0], date_fmt,
+                                                self.tz.text().strip() or "UTC", value_cols)
+        except Exception as exc:
+            return QMessageBox.critical(self, "Parse Error", f"Failed to parse tracers:\n{exc}")
+        if self.tracer_df.empty:
+            return QMessageBox.warning(self, "Empty", "No valid tracer rows parsed. Check date format/timezone.")
+        self.accept()
 
 class RenameDialog(QDialog):
     def __init__(self, current_factors, factor_names, parent=None):
@@ -147,35 +321,130 @@ class CombineFactorsDialog(QDialog):
 
 class TabbedVisualizer(QDialog):
     def __init__(self, panel, parent=None):
-        super().__init__(parent)                                         
-        self.panel = panel                                               
-        
-        n_rows = len(self.panel.g_matrix)
-        n_cols = len(self.panel.f_matrix)
-        q_ratio = self.panel._get_q_ratio(self.panel.current_factors, self.panel.current_fpeak, n_rows, n_cols)
-        
-        active_text = self.panel.combo_fpeak.currentText()
-        self.setWindowTitle(f"PyNSD Visualisation Suite ({active_text}) | Q/Qexp={q_ratio:.3f}") 
-        self.resize(1400, 850)                                           
-        
-        self.g_number = self.panel.get_scaled_g()                        
-        
-        self.tabs = QTabWidget()                                         
+        super().__init__(parent)
+        self.panel = panel
+        self.resize(1400, 850)
+        self._building = False                                           # Re-entrancy guard for slider-driven rebuilds
+        self._pending = None                                            # Latest slider request deferred during a build
+
+        self.tabs = QTabWidget()
         self.main_layout = QVBoxLayout(self)
-        self.main_layout.addWidget(self.tabs)                            
-        
-        self._build_size_tab()                                           
-        self._build_time_tab()                                           
-        self._build_seasonal_tab()                                       
-        self._build_dow_tab()    
-        self._build_diurnal_tab()                                                                                   
-        self._build_mass_tab()                                           
-        self._build_resid_recon_tab()                                    
-        self._build_diag_tab()                                           
-        
-        if self.panel.chk_wide_pmf.isChecked():                          
-            self._build_wide_profiles_tab()                              
-            self._build_widepmf_tab()                                    
+        self._build_controls()                                           # Live FPEAK / factor sliders
+        self.main_layout.addWidget(self.tabs)
+
+        self._reload_and_build()                                         # Populate tabs from active model
+
+    def _build_controls(self):
+        # Discover the computed batch runs so the sliders can only snap to models that exist on disk.
+        self.runs = {}                                                   # (factors, fpeak) -> combo index
+        for i in range(self.panel.combo_fpeak.count()):
+            text = self.panel.combo_fpeak.itemText(i)
+            fm = re.search(r"Factors:?\s*(\d+)", text, re.IGNORECASE)
+            pm = re.search(r"FPEAK:?\s*([-0-9.]+)", text, re.IGNORECASE)
+            if fm and pm:
+                self.runs[(int(fm.group(1)), float(pm.group(1)))] = i
+
+        if not self.runs:                                                # Library loads have no batch grid
+            note = QLabel("Live FPEAK / factor switching is unavailable (no batch runs in this session).")
+            note.setStyleSheet("color: gray; font-style: italic;")
+            self.main_layout.addWidget(note)
+            self.slider_fac = self.slider_fpk = None
+            return
+
+        self.factors_list = sorted({f for f, p in self.runs})
+        self.fpeaks_list = sorted({p for f, p in self.runs})
+
+        bar = QHBoxLayout()
+        self.slider_fac = QSlider(Qt.Orientation.Horizontal)
+        self.slider_fac.setRange(0, len(self.factors_list) - 1)
+        self.slider_fac.setToolTip("Slide to switch the number of factors in the active solution.")
+        self.lbl_fac_val = QLabel()
+        self.slider_fpk = QSlider(Qt.Orientation.Horizontal)
+        self.slider_fpk.setRange(0, len(self.fpeaks_list) - 1)
+        self.slider_fpk.setToolTip("Slide to switch the FPEAK rotation of the active solution.")
+        self.lbl_fpk_val = QLabel()
+
+        # Start the sliders on whatever model is already active.
+        try: fi = self.factors_list.index(self.panel.current_factors)
+        except ValueError: fi = 0
+        try: pi = self.fpeaks_list.index(self.panel.current_fpeak)
+        except ValueError: pi = 0
+        for s, v in ((self.slider_fac, fi), (self.slider_fpk, pi)):
+            s.blockSignals(True); s.setValue(v); s.blockSignals(False)   # Avoid firing a rebuild during setup
+        self._sync_control_labels()
+
+        self.slider_fac.valueChanged.connect(self._on_controls_changed)
+        self.slider_fpk.valueChanged.connect(self._on_controls_changed)
+
+        bar.addWidget(QLabel("Factors:")); bar.addWidget(self.slider_fac); bar.addWidget(self.lbl_fac_val)
+        bar.addSpacing(20)
+        bar.addWidget(QLabel("FPEAK:")); bar.addWidget(self.slider_fpk); bar.addWidget(self.lbl_fpk_val)
+        self.main_layout.addLayout(bar)
+
+    def _sync_control_labels(self):
+        self.lbl_fac_val.setText(str(self.factors_list[self.slider_fac.value()]))
+        self.lbl_fpk_val.setText(f"{self.fpeaks_list[self.slider_fpk.value()]:g}")
+
+    def _on_controls_changed(self):
+        self._sync_control_labels()
+        f_val = self.factors_list[self.slider_fac.value()]
+        p_val = self.fpeaks_list[self.slider_fpk.value()]
+        idx = self.runs.get((f_val, p_val))
+        if idx is None:                                                  # This factor/FPEAK pair was not computed
+            self.setWindowTitle(f"PyNSD Visualisation Suite | No run for Factors={f_val}, FPEAK={p_val:g}")
+            return
+        if self._building:                                              # A rebuild is already running: defer, don't re-enter
+            self._pending = (f_val, p_val)
+            return
+        self.panel.combo_fpeak.setCurrentIndex(idx)                      # Synchronously reloads F/G via update_fpeak
+        self._reload_and_build()
+
+    def _reload_and_build(self):
+        if self.panel.f_matrix is None or self.panel.g_matrix is None:   # Guard against a failed reload
+            return
+        if self._building:                                              # Never rebuild on top of an in-progress rebuild
+            return
+        self._building = True
+        try:
+            prev = self.tabs.currentIndex()
+            while self.tabs.count():                                     # Dispose old pages (and their figures)
+                w = self.tabs.widget(0); self.tabs.removeTab(0); w.deleteLater()
+
+            n_rows = len(self.panel.g_matrix); n_cols = len(self.panel.f_matrix)
+            q_ratio = self.panel._get_q_ratio(self.panel.current_factors, self.panel.current_fpeak, n_rows, n_cols)
+            active_text = self.panel.combo_fpeak.currentText()
+            self.setWindowTitle(f"PyNSD Visualisation Suite ({active_text}) | Q/Qexp={q_ratio:.3f}")
+
+            self.g_number = self.panel.get_scaled_g()
+
+            builders = [self._build_size_tab, self._build_time_tab, self._build_seasonal_tab,
+                        self._build_dow_tab, self._build_diurnal_tab, self._build_mass_tab,
+                        self._build_resid_recon_tab, self._build_diag_tab, self._build_qq_tab,
+                        self._build_summary_tab, self._build_gspace_tab, self._build_tracer_tab,
+                        self._build_polar_tab, self._build_nucsplit_tab]
+            if self.panel.chk_wide_pmf.isChecked():
+                builders += [self._build_wide_profiles_tab, self._build_widepmf_tab]
+
+            for build in builders:                                      # Isolate each tab: one failure must not kill the suite
+                try:
+                    build()
+                except Exception as e:
+                    print(f"Visualiser tab '{build.__name__}' failed: {e}")
+
+            if 0 <= prev < self.tabs.count():                           # Keep the user on the same tab
+                self.tabs.setCurrentIndex(prev)
+        finally:
+            self._building = False
+
+        # If slider moves arrived during the build, rebuild once for the latest position.
+        if self._pending is not None and getattr(self, 'slider_fac', None) is not None:
+            self._pending = None
+            f_val = self.factors_list[self.slider_fac.value()]
+            p_val = self.fpeaks_list[self.slider_fpk.value()]
+            idx = self.runs.get((f_val, p_val))
+            if idx is not None and (f_val, p_val) != (self.panel.current_factors, self.panel.current_fpeak):
+                self.panel.combo_fpeak.setCurrentIndex(idx)
+                self._reload_and_build()
 
     def _add_save_button(self, layout, fig, default_name):
         btn_save = QPushButton("Save Figure")                            
@@ -192,8 +461,10 @@ class TabbedVisualizer(QDialog):
         if self.panel.chk_wide_pmf.isChecked():
             n_bins = len(diams)
             n_hours = len(raw_vals) // n_bins
-            reshaped = raw_vals.reshape(n_hours, n_bins)
-            return np.mean(reshaped, axis=0), np.std(reshaped, axis=0) / np.sqrt(n_hours)
+            if n_hours >= 1 and n_hours * n_bins == len(raw_vals):       # Only reshape when it divides cleanly
+                reshaped = raw_vals.reshape(n_hours, n_bins)
+                return np.mean(reshaped, axis=0), np.std(reshaped, axis=0) / np.sqrt(n_hours)
+            return np.full(n_bins, np.nan), np.zeros(n_bins)             # Mismatch: return diam-length NaNs
         return raw_vals, np.zeros_like(raw_vals)
 
     def _build_size_tab(self):
@@ -205,6 +476,8 @@ class TabbedVisualizer(QDialog):
         for i in range(self.panel.current_factors):
             name = self.panel._get_factor_name(i)
             mean_n, se_n = self._get_mean_se_pnsd(i)
+            if len(mean_n) != len(diams):                                # Skip factors that don't match the diameter axis
+                continue
             line, = ax1.plot(diams, mean_n, label=name, lw=2.5)
             ax1.fill_between(diams, mean_n - se_n, mean_n + se_n, color=line.get_color(), alpha=0.2)
             ax2.plot(diams, mean_n * mass_factor, color=line.get_color(), lw=1.5, alpha=0.4, ls='--')
@@ -308,9 +581,11 @@ class TabbedVisualizer(QDialog):
         diams = self.panel.diams; mass_factor = (np.pi / 6) * (diams ** 3) * 1e-9
         for i in range(self.panel.current_factors):
             name = self.panel._get_factor_name(i)
-            mean_n, se_n = self._get_mean_se_pnsd(i)                     
-            mean_m = mean_n * mass_factor                                
-            ax.plot(diams, mean_m, label=name, lw=2.5)                   
+            mean_n, se_n = self._get_mean_se_pnsd(i)
+            if len(mean_n) != len(diams):                                # Skip factors that don't match the diameter axis
+                continue
+            mean_m = mean_n * mass_factor
+            ax.plot(diams, mean_m, label=name, lw=2.5)
         ax.set_xscale('log'); ax.set_xlabel('Mobility Diameter (nm)', fontsize=14)
         ax.set_ylabel(r'dM/dlogD$_p$ ($\mu$g m$^{-3}$)', fontsize=14)
         ax.legend(loc='upper right'); ax.grid(True, which="both", ls="--", alpha=0.4)
@@ -372,6 +647,445 @@ class TabbedVisualizer(QDialog):
             ax.set_xlabel('Scaled Residual'); ax.set_ylabel('Frequency')
         except: ax.text(0.5,0.5,"Missing Data", ha='center')
         fig.tight_layout(); layout.addWidget(canvas); self.tabs.addTab(tab, "Diagnostics")
+
+    def _build_qq_tab(self):
+        tab = QWidget(); layout = QVBoxLayout(tab)
+        fig = Figure(figsize=(8, 6)); canvas = FigureCanvasQTAgg(fig)
+        ax = fig.add_subplot(111)
+
+        # Gather Q/Qexp for every computed run straight from the batch combo box.
+        data = {}                                                        # fpeak -> [(factors, q), ...]
+        for i in range(self.panel.combo_fpeak.count()):
+            text = self.panel.combo_fpeak.itemText(i)
+            fm = re.search(r"Factors:?\s*(\d+)", text, re.IGNORECASE)
+            pm = re.search(r"FPEAK:?\s*([-0-9.]+)", text, re.IGNORECASE)
+            qm = re.search(r"Q/Qexp:?\s*([-0-9.]+)", text, re.IGNORECASE)
+            if not (fm and pm):
+                continue
+            q = float(qm.group(1)) if qm else np.nan
+            data.setdefault(float(pm.group(1)), []).append((int(fm.group(1)), q))
+
+        if not data:
+            ax.text(0.5, 0.5, "Q/Qexp scree needs a completed PMF batch\n(no runs found in this session).",
+                    ha='center', va='center')
+        else:
+            for fpeak in sorted(data):
+                pts = sorted(data[fpeak])
+                ax.plot([p[0] for p in pts], [p[1] for p in pts], marker='o', lw=1.8, label=f"FPEAK={fpeak:g}")
+            ax.axhline(1.0, color='red', ls='--', lw=1.2, alpha=0.7, label='Q/Qexp = 1')
+
+            active_q = next((q for fac, q in data.get(self.panel.current_fpeak, [])
+                             if fac == self.panel.current_factors), None)
+            if active_q is not None and np.isfinite(active_q):
+                ax.scatter([self.panel.current_factors], [active_q], s=180, facecolors='none',
+                           edgecolors='black', linewidths=2, zorder=5, label='Active run')
+
+            ax.set_xticks(sorted({fac for pts in data.values() for fac, _ in pts}))
+            ax.set_xlabel("Number of Factors", fontsize=13)
+            ax.set_ylabel("Q/Qexp", fontsize=13)
+            ax.legend(fontsize=9); ax.grid(True, ls='--', alpha=0.4)
+
+        fig.tight_layout(); layout.addWidget(canvas)
+        self._add_save_button(layout, fig, "Q_Qexp_Scree.png")
+        self.tabs.addTab(tab, "Q/Qexp Scree")
+
+    def _build_summary_tab(self):
+        tab = QWidget(); layout = QVBoxLayout(tab)
+        diams = self.panel.diams
+        dlogdp = np.log10(diams[1] / diams[0]) if len(diams) > 1 else 1.0
+        mass_factor = (np.pi / 6) * (diams ** 3) * 1e-9
+
+        # Real mean dN/dlogDp contributed by each factor = mean(raw G) * F profile.
+        profiles, number_concs = [], []
+        for i in range(self.panel.current_factors):
+            f_mean, _ = self._get_mean_se_pnsd(i)
+            real = f_mean * self.panel.g_matrix.iloc[:, i].mean()
+            profiles.append(real)
+            number_concs.append(float(np.sum(real) * dlogdp))
+        total_n = np.sum(number_concs)
+
+        rows = []
+        for i in range(self.panel.current_factors):
+            real = profiles[i]
+            w = np.clip(real, 0, None)
+            n_conc = number_concs[i]
+            pct = 100.0 * n_conc / total_n if total_n else np.nan
+            modal = diams[int(np.argmax(real))] if len(real) else np.nan
+            gmd = np.exp(np.sum(w * np.log(diams)) / np.sum(w)) if np.sum(w) > 0 else np.nan
+            mass = float(np.sum(real * mass_factor) * dlogdp)
+            rows.append([self.panel._get_factor_name(i), n_conc, pct, modal, gmd, mass])
+
+        headers = ["Factor", "Mean N (cm⁻³)", "% of N", "Modal Dp (nm)", "GMD (nm)", "Mass (µg m⁻³)"]
+        self.summary_df = pd.DataFrame([r[1:] for r in rows],
+                                       index=[r[0] for r in rows], columns=headers[1:])
+
+        table = QTableWidget(len(rows), len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        for r, row in enumerate(rows):
+            for c, val in enumerate(row):
+                table.setItem(r, c, QTableWidgetItem(val if c == 0 else f"{val:.3g}"))
+        table.resizeColumnsToContents()
+        layout.addWidget(table)
+
+        btn = QPushButton("Export Summary to CSV")
+        btn.clicked.connect(self._export_summary)
+        layout.addWidget(btn)
+        self.tabs.addTab(tab, "Factor Summary")
+
+    def _export_summary(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Save Factor Summary", "Factor_Summary.csv", "CSV (*.csv)")
+        if path:
+            self.summary_df.to_csv(path, index_label="Factor")
+
+    def _build_gspace_tab(self):
+        tab = QWidget(); layout = QVBoxLayout(tab)
+        ctrl = QHBoxLayout()
+        self.gs_x = QComboBox(); self.gs_y = QComboBox()
+        for i in range(self.panel.current_factors):
+            n = self.panel._get_factor_name(i)
+            self.gs_x.addItem(n, i); self.gs_y.addItem(n, i)
+        if self.panel.current_factors > 1:
+            self.gs_y.setCurrentIndex(1)
+        self.gs_norm = QCheckBox("Normalise to max"); self.gs_norm.setChecked(True)
+        ctrl.addWidget(QLabel("X factor:")); ctrl.addWidget(self.gs_x)
+        ctrl.addWidget(QLabel("Y factor:")); ctrl.addWidget(self.gs_y)
+        ctrl.addWidget(self.gs_norm); ctrl.addStretch()
+        layout.addLayout(ctrl)
+
+        self.gs_fig = Figure(figsize=(7, 6)); self.gs_canvas = FigureCanvasQTAgg(self.gs_fig)
+        layout.addWidget(self.gs_canvas)
+        trigger = lambda: self._update_gspace_plot()
+        self.gs_x.currentIndexChanged.connect(trigger)
+        self.gs_y.currentIndexChanged.connect(trigger)
+        self.gs_norm.stateChanged.connect(trigger)
+        self._update_gspace_plot()
+        self._add_save_button(layout, self.gs_fig, "G_Space_Scatter.png")
+        self.tabs.addTab(tab, "G-Space Scatter")
+
+    def _update_gspace_plot(self):
+        self.gs_fig.clear()
+        ax = self.gs_fig.add_subplot(111)
+        ix = self.gs_x.currentData(); iy = self.gs_y.currentData()
+        x = self.panel.g_matrix.iloc[:, ix].to_numpy(dtype=float)
+        y = self.panel.g_matrix.iloc[:, iy].to_numpy(dtype=float)
+        if self.gs_norm.isChecked():
+            if x.max() > 0: x = x / x.max()
+            if y.max() > 0: y = y / y.max()
+        ax.scatter(x, y, s=10, alpha=0.4, edgecolors='none')
+        r = np.corrcoef(x, y)[0, 1] if len(x) > 2 and np.std(x) > 0 and np.std(y) > 0 else np.nan
+        lim = max(x.max(), y.max()) if len(x) else 1.0
+        ax.plot([0, lim], [0, lim], color='red', ls='--', lw=1, alpha=0.6, label='1:1')
+        ax.set_xlabel(f"{self.panel._get_factor_name(ix)} contribution", fontsize=12)
+        ax.set_ylabel(f"{self.panel._get_factor_name(iy)} contribution", fontsize=12)
+        ax.set_title(f"Edge plot   (Pearson r = {r:.3f})", fontsize=12)
+        ax.legend(fontsize=9); ax.grid(True, ls='--', alpha=0.3)
+        self.gs_fig.tight_layout(); self.gs_canvas.draw()
+
+    def _build_tracer_tab(self):
+        if self.panel.tracer_df is None:                                 # Only present once tracers are loaded
+            return
+        tab = QWidget(); layout = QVBoxLayout(tab)
+        self._tracer_aligned = align_to_index(self.panel.tracer_df, self.panel.g_matrix.index)
+
+        ctrl = QHBoxLayout()
+        self.tr_method = QComboBox(); self.tr_method.addItems(["Pearson", "Spearman"])
+        self.tr_factor = QComboBox()
+        for i in range(self.panel.current_factors):
+            self.tr_factor.addItem(self.panel._get_factor_name(i), i)
+        self.tr_col = QComboBox(); self.tr_col.addItems([str(c) for c in self._tracer_aligned.columns])
+        ctrl.addWidget(QLabel("Method:")); ctrl.addWidget(self.tr_method)
+        ctrl.addWidget(QLabel("Factor:")); ctrl.addWidget(self.tr_factor)
+        ctrl.addWidget(QLabel("Tracer:")); ctrl.addWidget(self.tr_col); ctrl.addStretch()
+        layout.addLayout(ctrl)
+
+        self.tr_fig = Figure(figsize=(11, 8)); self.tr_canvas = FigureCanvasQTAgg(self.tr_fig)
+        layout.addWidget(self.tr_canvas)
+        trigger = lambda: self._update_tracer_plot()
+        for w in [self.tr_method, self.tr_factor, self.tr_col]:
+            w.currentIndexChanged.connect(trigger)
+        self._update_tracer_plot()
+        self._add_save_button(layout, self.tr_fig, "Tracer_Correlation.png")
+        self.tabs.addTab(tab, "Tracer Correlation")
+
+    def _update_tracer_plot(self):
+        self.tr_fig.clear()
+        g = self.g_number                                               # Scaled particle number per factor
+        tr = self._tracer_aligned
+        method = self.tr_method.currentText().lower()
+        factor_names = [self.panel._get_factor_name(i) for i in range(self.panel.current_factors)]
+        cols = [str(c) for c in tr.columns]
+
+        corr = np.full((len(factor_names), len(cols)), np.nan)
+        for i in range(len(factor_names)):
+            gi = pd.Series(g.iloc[:, i].to_numpy(dtype=float))
+            for j, c in enumerate(tr.columns):
+                tj = pd.Series(pd.to_numeric(tr[c], errors='coerce').to_numpy(dtype=float))
+                mask = gi.notna() & tj.notna()
+                if mask.sum() > 2 and gi[mask].std() > 0 and tj[mask].std() > 0:
+                    corr[i, j] = gi[mask].corr(tj[mask], method=method)
+
+        grid = self.tr_fig.add_gridspec(2, 2, height_ratios=[1.2, 1.0])
+        ax_h = self.tr_fig.add_subplot(grid[0, :])
+        im = ax_h.imshow(corr, cmap='RdBu_r', vmin=-1, vmax=1, aspect='auto')
+        ax_h.set_xticks(range(len(cols))); ax_h.set_xticklabels(cols, rotation=45, ha='right')
+        ax_h.set_yticks(range(len(factor_names))); ax_h.set_yticklabels(factor_names)
+        for i in range(len(factor_names)):
+            for j in range(len(cols)):
+                if np.isfinite(corr[i, j]):
+                    ax_h.text(j, i, f"{corr[i, j]:.2f}", ha='center', va='center', fontsize=8,
+                              color='white' if abs(corr[i, j]) > 0.5 else 'black')
+        self.tr_fig.colorbar(im, ax=ax_h, label=f"{method.title()} r", fraction=0.025)
+        ax_h.set_title("Factor (scaled G) vs tracer correlation")
+
+        fi = self.tr_factor.currentData(); col = self.tr_col.currentText()
+        x = pd.Series(pd.to_numeric(tr[col], errors='coerce').to_numpy(dtype=float))
+        y = pd.Series(g.iloc[:, fi].to_numpy(dtype=float))
+        mask = x.notna() & y.notna()
+
+        ax_s = self.tr_fig.add_subplot(grid[1, 0])
+        if mask.sum() > 2:
+            xs = x[mask].to_numpy(); ys = y[mask].to_numpy()
+            ax_s.scatter(xs, ys, s=8, alpha=0.4, edgecolors='none')
+            if np.std(xs) > 0:
+                m, b = np.polyfit(xs, ys, 1)
+                xr = np.array([xs.min(), xs.max()])
+                ax_s.plot(xr, m * xr + b, color='red', lw=1.5)
+                r = np.corrcoef(xs, ys)[0, 1]
+                ax_s.set_title(f"{self.panel._get_factor_name(fi)} vs {col}  (r={r:.2f}, R²={r**2:.2f})", fontsize=10)
+        ax_s.set_xlabel(col); ax_s.set_ylabel(f"{self.panel._get_factor_name(fi)} (cm⁻³)")
+        ax_s.grid(True, ls='--', alpha=0.3)
+
+        ax_t = self.tr_fig.add_subplot(grid[1, 1])
+        idx = self.panel.g_matrix.index
+        ax_t.plot(idx, y.to_numpy(), color='steelblue', lw=1)
+        ax_t2 = ax_t.twinx()
+        ax_t2.plot(idx, x.to_numpy(), color='darkorange', lw=1, alpha=0.7)
+        ax_t.set_ylabel(self.panel._get_factor_name(fi), color='steelblue', fontsize=9)
+        ax_t2.set_ylabel(col, color='darkorange', fontsize=9)
+        ax_t.tick_params(axis='x', labelrotation=30, labelsize=8)
+        ax_t.set_title("Time-series overlay", fontsize=10)
+
+        self.tr_fig.tight_layout(); self.tr_canvas.draw()
+
+    def _build_polar_tab(self):
+        if self.panel.tracer_df is None:                                 # Needs WD (and ideally WS) among tracers
+            return
+        self._polar_aligned = align_to_index(self.panel.tracer_df, self.panel.g_matrix.index)
+        cols = [str(c) for c in self._polar_aligned.columns]
+
+        tab = QWidget(); layout = QVBoxLayout(tab)
+        ctrl = QGridLayout()
+        self.pl_factor = QComboBox()
+        for i in range(self.panel.current_factors):
+            self.pl_factor.addItem(self.panel._get_factor_name(i), i)
+        self.pl_wd = QComboBox(); self.pl_wd.addItems(cols)
+        self.pl_ws = QComboBox(); self.pl_ws.addItem("(none)"); self.pl_ws.addItems(cols)
+        low = {c.lower(): c for c in cols}
+        for cand in ["wd", "wind_dir", "wind_direction", "wdir", "direction"]:
+            if cand in low: self.pl_wd.setCurrentText(low[cand]); break
+        for cand in ["ws", "wind_speed", "windspeed", "speed"]:
+            if cand in low: self.pl_ws.setCurrentText(low[cand]); break
+        self.pl_pct = QSpinBox(); self.pl_pct.setRange(50, 99); self.pl_pct.setValue(75)
+        ctrl.addWidget(QLabel("Factor:"), 0, 0); ctrl.addWidget(self.pl_factor, 0, 1)
+        ctrl.addWidget(QLabel("WD col:"), 0, 2); ctrl.addWidget(self.pl_wd, 0, 3)
+        ctrl.addWidget(QLabel("WS col:"), 1, 2); ctrl.addWidget(self.pl_ws, 1, 3)
+        ctrl.addWidget(QLabel("CBPF percentile:"), 1, 0); ctrl.addWidget(self.pl_pct, 1, 1)
+        layout.addLayout(ctrl)
+
+        self.pl_fig = Figure(figsize=(12, 5)); self.pl_canvas = FigureCanvasQTAgg(self.pl_fig)
+        layout.addWidget(self.pl_canvas)
+        trigger = lambda: self._update_polar_plot()
+        for w in [self.pl_factor, self.pl_wd, self.pl_ws]:
+            w.currentIndexChanged.connect(trigger)
+        self.pl_pct.valueChanged.connect(trigger)
+        self._update_polar_plot()
+        self._add_save_button(layout, self.pl_fig, "Factor_Polar.png")
+        self.tabs.addTab(tab, "Polar / CBPF")
+
+    def _update_polar_plot(self):
+        self.pl_fig.clear()
+        fi = self.pl_factor.currentData()
+        name = self.panel._get_factor_name(fi)
+        contrib = self.g_number.iloc[:, fi].to_numpy(dtype=float)
+        wd = pd.to_numeric(self._polar_aligned[self.pl_wd.currentText()], errors='coerce').to_numpy(dtype=float)
+        ws_col = self.pl_ws.currentText()
+        ws = (pd.to_numeric(self._polar_aligned[ws_col], errors='coerce').to_numpy(dtype=float)
+              if ws_col in self._polar_aligned.columns else None)
+
+        n_sec = 16
+        edges = np.linspace(0, 360, n_sec + 1)
+        centers = np.deg2rad((edges[:-1] + edges[1:]) / 2)
+        wd_mod = np.mod(wd, 360.0)
+
+        # Left: mean factor contribution by wind sector (pollutant rose).
+        ax1 = self.pl_fig.add_subplot(121, projection='polar')
+        means = []
+        for k in range(n_sec):
+            m = (wd_mod >= edges[k]) & (wd_mod < edges[k + 1]) & np.isfinite(contrib)
+            means.append(float(np.nanmean(contrib[m])) if m.any() else 0.0)
+        peak = max(means) or 1.0
+        ax1.bar(centers, means, width=np.deg2rad(360 / n_sec),
+                color=plt.cm.viridis(np.array(means) / peak), edgecolor='k', linewidth=0.5, alpha=0.85)
+        ax1.set_theta_zero_location("N"); ax1.set_theta_direction(-1)
+        ax1.set_title(f"{name}: mean contribution by wind sector", fontsize=10)
+
+        # Right: CBPF (WD x WS grid) where WS is available, else CPF by WD only.
+        finite = np.isfinite(contrib)
+        thr = np.nanpercentile(contrib[finite], self.pl_pct.value()) if finite.any() else np.nan
+        ax2 = self.pl_fig.add_subplot(122, projection='polar')
+        if ws is not None and np.isfinite(ws).any():
+            n_rings = 6
+            ws_max = np.nanpercentile(ws[np.isfinite(ws)], 95)
+            ring_edges = np.linspace(0, ws_max if ws_max > 0 else 1.0, n_rings + 1)
+            prob = np.full((n_rings, n_sec), np.nan)
+            for a in range(n_sec):
+                for rr in range(n_rings):
+                    m = ((wd_mod >= edges[a]) & (wd_mod < edges[a + 1]) &
+                         (ws >= ring_edges[rr]) & (ws < ring_edges[rr + 1]) & finite)
+                    if m.sum() >= 5:
+                        prob[rr, a] = np.mean(contrib[m] > thr)
+            T, R = np.meshgrid(np.deg2rad(edges), ring_edges)
+            mesh = ax2.pcolormesh(T, R, prob, cmap='turbo', vmin=0, vmax=1, shading='flat')
+            self.pl_fig.colorbar(mesh, ax=ax2, label=f"P(> P{self.pl_pct.value()})", fraction=0.045)
+            ax2.set_title(f"CBPF: {name}  (WD x WS)", fontsize=10)
+        else:
+            cpf = []
+            for k in range(n_sec):
+                m = (wd_mod >= edges[k]) & (wd_mod < edges[k + 1]) & finite
+                cpf.append(float(np.mean(contrib[m] > thr)) if m.sum() >= 5 else 0.0)
+            ax2.bar(centers, cpf, width=np.deg2rad(360 / n_sec), color='indianred', edgecolor='k', linewidth=0.5)
+            ax2.set_title(f"CPF: P(contribution > P{self.pl_pct.value()}) by WD", fontsize=10)
+        ax2.set_theta_zero_location("N"); ax2.set_theta_direction(-1)
+
+        self.pl_fig.tight_layout(); self.pl_canvas.draw()
+
+    def _build_nucsplit_tab(self):
+        # Split the Nucleation factor into Traffic and Photochemical sources after
+        # Rodriguez & Cuevas (2007), using NOx as a traffic proxy scaled per day at the morning peak.
+        if self.panel.tracer_df is None:
+            return
+        tab = QWidget(); layout = QVBoxLayout(tab)
+        if self.panel.chk_wide_pmf.isChecked():
+            msg = QLabel("Nucleation splitting needs continuous hourly data.\nDisable WidePMF mode to use this tool.")
+            msg.setStyleSheet("color: gray; font-style: italic;")
+            layout.addWidget(msg); self.tabs.addTab(tab, "Nucleation Split"); return
+
+        self._nuc_aligned = align_to_index(self.panel.tracer_df, self.panel.g_matrix.index)
+        cols = [str(c) for c in self._nuc_aligned.columns]
+
+        ctrl = QGridLayout()
+        self.ns_factor = QComboBox()
+        for i in range(self.panel.current_factors):
+            self.ns_factor.addItem(self.panel._get_factor_name(i), i)
+        self.ns_nox = QComboBox(); self.ns_nox.addItems(cols)
+        self.ns_sr = QComboBox(); self.ns_sr.addItems(cols)
+        for c in cols:                                                    # Guess NOx and solar-radiation columns
+            if "nox" in c.lower():
+                self.ns_nox.setCurrentText(c); break
+        for c in cols:
+            cl = c.lower()
+            if "solar" in cl or "rad" in cl or cl == "sr" or "global" in cl:
+                self.ns_sr.setCurrentText(c); break
+
+        self.ns_peak = QSpinBox(); self.ns_peak.setRange(0, 23); self.ns_peak.setValue(8)
+        self.ns_daystart = QSpinBox(); self.ns_daystart.setRange(0, 23); self.ns_daystart.setValue(8)
+        self.ns_dayend = QSpinBox(); self.ns_dayend.setRange(0, 23); self.ns_dayend.setValue(21)
+        self.ns_thr = QDoubleSpinBox(); self.ns_thr.setRange(0, 2000); self.ns_thr.setValue(10.0)
+        self.ns_lowsr = QComboBox(); self.ns_lowsr.addItems(["Assign all to Traffic", "Apply NOx formula anyway"])
+
+        ctrl.addWidget(QLabel("Nucleation factor:"), 0, 0); ctrl.addWidget(self.ns_factor, 0, 1)
+        ctrl.addWidget(QLabel("NOx col:"), 0, 2); ctrl.addWidget(self.ns_nox, 0, 3)
+        ctrl.addWidget(QLabel("Solar rad col:"), 0, 4); ctrl.addWidget(self.ns_sr, 0, 5)
+        ctrl.addWidget(QLabel("Peak hour:"), 1, 0); ctrl.addWidget(self.ns_peak, 1, 1)
+        ctrl.addWidget(QLabel("Day window:"), 1, 2)
+        day_box = QHBoxLayout(); day_box.addWidget(self.ns_daystart); day_box.addWidget(QLabel("to")); day_box.addWidget(self.ns_dayend)
+        ctrl.addLayout(day_box, 1, 3)
+        ctrl.addWidget(QLabel("SR threshold (W m⁻²):"), 1, 4); ctrl.addWidget(self.ns_thr, 1, 5)
+        ctrl.addWidget(QLabel("Daytime when SR ≤ threshold:"), 2, 0); ctrl.addWidget(self.ns_lowsr, 2, 1, 1, 3)
+        layout.addLayout(ctrl)
+
+        self.ns_status = QLabel(""); layout.addWidget(self.ns_status)
+        self.ns_fig = Figure(figsize=(12, 5)); self.ns_canvas = FigureCanvasQTAgg(self.ns_fig)
+        layout.addWidget(self.ns_canvas)
+
+        trigger = lambda: self._update_nucsplit()
+        for w in [self.ns_factor, self.ns_nox, self.ns_sr, self.ns_lowsr]:
+            w.currentIndexChanged.connect(trigger)
+        for w in [self.ns_peak, self.ns_daystart, self.ns_dayend]:
+            w.valueChanged.connect(trigger)
+        self.ns_thr.valueChanged.connect(trigger)
+
+        btn = QPushButton("Export Sources to CSV"); btn.clicked.connect(self._export_nucsplit)
+        layout.addWidget(btn)
+        self._add_save_button(layout, self.ns_fig, "Nucleation_Split.png")
+        self._update_nucsplit()
+        self.tabs.addTab(tab, "Nucleation Split")
+
+    def _compute_nuc_split(self):
+        fi = self.ns_factor.currentData()
+        idx = pd.DatetimeIndex(self.panel.g_matrix.index)
+        nuc = self.g_number.iloc[:, fi].to_numpy(dtype=float)            # Scaled particle number of the factor
+        nox = pd.to_numeric(self._nuc_aligned[self.ns_nox.currentText()], errors='coerce').to_numpy(dtype=float)
+        sr = pd.to_numeric(self._nuc_aligned[self.ns_sr.currentText()], errors='coerce').to_numpy(dtype=float)
+
+        work = pd.DataFrame({'Nuc': nuc, 'NOx': nox, 'SR': sr}, index=idx)
+        work['date'] = work.index.normalize()                           # Hours taken from the PMF timeline
+        work['hour'] = work.index.hour
+
+        # Day-specific scale factor kd = Nucleation / NOx at the morning peak hour.
+        peak = work[work['hour'] == self.ns_peak.value()].copy()
+        with np.errstate(divide='ignore', invalid='ignore'):
+            peak['kd'] = (peak['Nuc'] / peak['NOx']).replace([np.inf, -np.inf], np.nan)
+        work['kd'] = work['date'].map(peak.groupby('date')['kd'].mean())
+
+        day_mask = (work['hour'] >= self.ns_daystart.value()) & (work['hour'] <= self.ns_dayend.value())
+        sr_high = work['SR'] > self.ns_thr.value()
+        low_sr_all_traffic = (self.ns_lowsr.currentIndex() == 0)
+        formula_mask = (day_mask & sr_high) if low_sr_all_traffic else day_mask
+        formula_mask = formula_mask & work['kd'].notna()                # Fall back to all-traffic when kd is undefined
+
+        traffic = work['Nuc'].copy()                                    # Default: all nucleation assigned to traffic
+        traffic[formula_mask] = work['kd'][formula_mask] * work['NOx'][formula_mask]
+        traffic = np.minimum(np.clip(traffic.to_numpy(dtype=float), 0, None), work['Nuc'].to_numpy(dtype=float))
+        photo = work['Nuc'].to_numpy(dtype=float) - traffic
+
+        return pd.DataFrame({'Nucleation': work['Nuc'].to_numpy(dtype=float),
+                             'Traffic_nucleation': traffic, 'Photonucleation': photo}, index=idx)
+
+    def _update_nucsplit(self):
+        self.ns_fig.clear()
+        res = self._compute_nuc_split()
+        self._nucsplit_df = res
+
+        tot_t = np.nansum(res['Traffic_nucleation']); tot_p = np.nansum(res['Photonucleation'])
+        tot = tot_t + tot_p
+        if tot > 0:
+            self.ns_status.setText(f"Mean split over record: Traffic {100 * tot_t / tot:.1f}%, "
+                                   f"Photochemical {100 * tot_p / tot:.1f}%")
+
+        ax1 = self.ns_fig.add_subplot(121)
+        dm = res.groupby(res.index.hour).mean(numeric_only=True)
+        ax1.stackplot(dm.index, dm['Traffic_nucleation'], dm['Photonucleation'],
+                      labels=['Traffic nucleation', 'Photonucleation'], colors=['#555555', 'gold'], alpha=0.85)
+        ax1.plot(dm.index, dm['Nucleation'], color='black', lw=1.5, ls='--', label='Total Nucleation')
+        ax1.set_xlabel("Hour of day"); ax1.set_ylabel("Particle number (cm⁻³)")
+        ax1.set_xticks(range(0, 24, 3)); ax1.legend(fontsize=8); ax1.grid(True, ls='--', alpha=0.3)
+        ax1.set_title("Mean diurnal split", fontsize=10)
+
+        ax2 = self.ns_fig.add_subplot(122)
+        ax2.stackplot(res.index, res['Traffic_nucleation'].fillna(0), res['Photonucleation'].fillna(0),
+                      labels=['Traffic nucleation', 'Photonucleation'], colors=['#555555', 'gold'], alpha=0.8)
+        ax2.set_ylabel("Particle number (cm⁻³)"); ax2.set_title("Source time series", fontsize=10)
+        ax2.tick_params(axis='x', labelrotation=30, labelsize=8)
+
+        self.ns_fig.tight_layout(); self.ns_canvas.draw()
+
+    def _export_nucsplit(self):
+        if getattr(self, '_nucsplit_df', None) is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Save Nucleation Sources", "Nucleation_Sources.csv", "CSV (*.csv)")
+        if path:
+            self._nucsplit_df.to_csv(path, index_label="datetime")
 
     def _build_wide_profiles_tab(self):
         tab = QWidget(); layout = QVBoxLayout(tab)
@@ -499,10 +1213,11 @@ class PMFPanel(QWidget):
         self.df = None                                                   
         self.dates = None                                                
         self.diams = None                                                
-        self.f_matrix = None                                             
-        self.g_matrix = None                                             
-        
-        self.settings = QSettings("PyNSD", "PMF_Config")                 
+        self.f_matrix = None
+        self.g_matrix = None
+        self.tracer_df = None                                            # External gas/met tracers (datetime-indexed)
+
+        self.settings = QSettings("PyNSD", "PMF_Config")
         self.pmf_exe_path = self.settings.value("exe_path", "")          
         self.pmf_key_path = self.settings.value("key_path", "")          
         
@@ -730,6 +1445,11 @@ class PMFPanel(QWidget):
         btn_combine.setStyleSheet("background-color: #673AB7; color: white;")    # Purple style
         btn_combine.clicked.connect(self.combine_factors)                        # Link logic
 
+        btn_boot = QPushButton("Bootstrap Uncertainty")                          # Resample + re-run PMF
+        btn_boot.setStyleSheet("background-color: #E91E63; color: white;")       # Pink style
+        btn_boot.setToolTip("Re-run PMF on resampled data many times to estimate factor uncertainty. Slow.")
+        btn_boot.clicked.connect(self.bootstrap_uncertainty)                     # Link logic
+
         btn_archive = QPushButton("4. Archive to Library")                       # New Archive Button
         btn_archive.setStyleSheet("background-color: #009688; color: white;")    # Teal style
         btn_archive.clicked.connect(self.save_current_model)                     # Link logic
@@ -738,7 +1458,7 @@ class PMFPanel(QWidget):
         btn_load_lib.setStyleSheet("background-color: #795548; color: white;")   # Brown style
         btn_load_lib.clicked.connect(self.load_from_library)                     # Link logic
         
-        for b in [btn_vis, btn_opt, btn_rename, btn_combine, btn_archive, btn_load_lib]:
+        for b in [btn_vis, btn_opt, btn_rename, btn_combine, btn_boot, btn_archive, btn_load_lib]:
             action_layout.addWidget(b)                                           # Add all to layout
         action_layout.addWidget(btn_vis)                                                 # Existing
         action_layout.addWidget(btn_opt)                                                 # Existing
@@ -746,9 +1466,19 @@ class PMFPanel(QWidget):
         action_layout.addWidget(btn_archive)                                             # Existing
         action_layout.addWidget(btn_load_lib)                                            # Add new button
         
-        explore_layout.addLayout(action_layout)                                          # Pack layout                          
-        
-        btn_export = QPushButton("4. Export Final Array to CSV")         
+        explore_layout.addLayout(action_layout)                                          # Pack layout
+
+        tracer_row = QHBoxLayout()                                                        # External tracer loader
+        btn_tracer = QPushButton("Load External Tracers (gas/met)")
+        btn_tracer.setStyleSheet("background-color: #3F51B5; color: white;")
+        btn_tracer.setToolTip("Load co-located NOx/BC/O3/solar/wind data for correlation, polar and nucleation-split tools.")
+        btn_tracer.clicked.connect(self.open_tracer_loader)
+        self.lbl_tracer = QLabel("No tracers loaded")
+        self.lbl_tracer.setStyleSheet("color: gray;")
+        tracer_row.addWidget(btn_tracer); tracer_row.addWidget(self.lbl_tracer); tracer_row.addStretch()
+        explore_layout.addLayout(tracer_row)
+
+        btn_export = QPushButton("4. Export Final Array to CSV")
         btn_export.setStyleSheet("background-color: #607D8B; color: white;")
         btn_export.setToolTip("Step 9: Compile active matrices (F, Raw G, Scaled G) to local disk for reporting.")
         btn_export.clicked.connect(self.export_final_data)               
@@ -968,6 +1698,125 @@ class PMFPanel(QWidget):
         else:
             QMessageBox.warning(self, "Optimisation Failed", "Could not calculate Q/Qexp from the residuals.")
 
+    def _read_matrix(self, path, shape):
+        vals = np.array(open(path).read().replace(',', ' ').split(), dtype=float)
+        return vals.reshape(shape)
+
+    def _match_factors(self, base_F, boot_F):
+        # Greedy assignment of bootstrap factors to base factors by profile correlation.
+        k = base_F.shape[1]
+        corr = np.zeros((k, k))
+        for a in range(k):
+            for c in range(k):
+                ca, cb = base_F[:, a], boot_F[:, c]
+                if np.std(ca) > 0 and np.std(cb) > 0:
+                    corr[a, c] = np.corrcoef(ca, cb)[0, 1]
+        mapping = [-1] * k; scores = [0.0] * k; used = set()
+        for a in np.argsort(-corr.max(axis=1)):                          # Assign the most distinctive base factor first
+            for c in np.argsort(-corr[a]):
+                if c not in used:
+                    mapping[a] = int(c); scores[a] = float(corr[a, c]); used.add(int(c)); break
+        return mapping, scores
+
+    def bootstrap_uncertainty(self):
+        if not self.pmf_exe_path or self.current_factors == 0 or self.f_matrix is None:
+            return QMessageBox.warning(self, "Error", "Run a batch and select an active model first.")
+        if not self.pmf_key_path:
+            return QMessageBox.warning(self, "Error", "Locate pmf2key.key first.")
+
+        n_boot, ok = QInputDialog.getInt(self, "Bootstrap Runs", "Number of bootstrap resamples:", 50, 5, 500)
+        if not ok:
+            return
+
+        lo_min = max(1, int(n_boot * 5 / 60)); hi_min = max(1, int(n_boot * 30 / 60))
+        warn = ("☠️  HEADS UP\n\n"
+                f"This re-runs pmf2.exe {n_boot} times from scratch on resampled data.\n"
+                f"Each run takes several seconds to about a minute, so the whole bootstrap will "
+                f"likely take on the order of {lo_min}-{hi_min} MINUTES.\n\n"
+                "The interface stays busy the entire time (a progress bar with a live ETA is shown, "
+                "and there is a Cancel button). Continue?")
+        if QMessageBox.question(self, "Bootstrap Uncertainty", warn,
+                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                                ) != QMessageBox.StandardButton.Yes:
+            return
+
+        import time
+        current_error = self.spin_error.value()
+        factors, fpeak = self.current_factors, self.current_fpeak
+
+        # Base matrices (written to run_dir; this does not delete the F_FACTOR files of the active model).
+        n_rows, n_cols = self.export_pmf_data(current_error)
+        base_mat = self._read_matrix(os.path.join(self.run_dir, "MATRIX.DAT"), (n_rows, n_cols))
+        base_err = self._read_matrix(os.path.join(self.run_dir, "T_MATRIX.DAT"), (n_rows, n_cols))
+        base_v = self._read_matrix(os.path.join(self.run_dir, "V_MATRIX.DAT"), (n_rows, n_cols))
+        base_F = self.f_matrix.to_numpy(dtype=float)                     # (n_variables, k)
+
+        # Isolated working dir so the current model's outputs stay intact.
+        boot_dir = os.path.join(self.run_dir, "bootstrap")
+        if os.path.exists(boot_dir):
+            for f in os.listdir(boot_dir):
+                fp = os.path.join(boot_dir, f)
+                if os.path.isfile(fp): os.remove(fp)
+        else:
+            os.makedirs(boot_dir)
+        shutil.copy(self.pmf_key_path, os.path.join(boot_dir, "pmf2key.key"))
+        with open(os.path.join(boot_dir, "FKEY.DAT"), 'w', newline='\r\n') as f:
+            row = " ".join(["0"] * n_cols)
+            for _ in range(factors):
+                f.write(row + "\r\n")
+
+        dialog = BootstrapProgressDialog(n_boot, self); dialog.show()
+        dlogdp = np.log10(self.diams[1] / self.diams[0]) if len(self.diams) > 1 else 1.0
+
+        F_boot = [[] for _ in range(factors)]
+        contrib = []
+        n_used = 0; n_scores = 0; n_ok = 0; thresh = 0.6
+        start = time.time()
+
+        for b in range(1, n_boot + 1):
+            if dialog.cancelled:
+                break
+            idx = np.random.randint(0, n_rows, n_rows)                   # Resample rows with replacement
+            np.savetxt(os.path.join(boot_dir, "MATRIX.DAT"), base_mat[idx], fmt="%.6g")
+            np.savetxt(os.path.join(boot_dir, "T_MATRIX.DAT"), base_err[idx], fmt="%.6g")
+            np.savetxt(os.path.join(boot_dir, "V_MATRIX.DAT"), base_v[idx], fmt="%.6g")
+            generate_pmf_ini(boot_dir, n_rows, n_cols, factors, fpeak, current_error, task_name="PyNSD")
+
+            try:
+                proc = subprocess.Popen([self.pmf_exe_path, "PyNSD"], cwd=boot_dir,
+                                        creationflags=subprocess.CREATE_NEW_CONSOLE)
+                proc.wait()
+                bf = self._read_matrix(os.path.join(boot_dir, "F_FACTOR.TXT"), (factors, n_cols)).T   # (n_vars, k)
+                bg = np.array(open(os.path.join(boot_dir, "G_FACTOR.TXT")).read().replace(',', ' ').split(),
+                              dtype=float).reshape(-1, factors)                                       # (n_rows, k)
+            except Exception as e:
+                print(f"Bootstrap {b} failed: {e}")
+                elapsed = time.time() - start
+                dialog.update(b, n_boot, (elapsed / b) * (n_boot - b), (n_ok / n_scores) if n_scores else 0.0)
+                continue
+
+            mapping, scores = self._match_factors(base_F, bf)
+            for a in range(factors):
+                F_boot[a].append(bf[:, mapping[a]])
+            contrib.append(np.array([bg[:, mapping[a]].mean() * (bf[:, mapping[a]].sum() * dlogdp)
+                                     for a in range(factors)]))
+            n_used += 1
+            n_scores += factors; n_ok += int(np.sum(np.array(scores) >= thresh))
+
+            elapsed = time.time() - start
+            dialog.update(b, n_boot, (elapsed / b) * (n_boot - b), (n_ok / n_scores) if n_scores else 0.0)
+
+        dialog.close()
+
+        if n_used < 2:
+            return QMessageBox.warning(self, "Bootstrap", "Too few successful bootstrap runs to summarise.")
+
+        F_boot_arr = [np.array(F_boot[a]) for a in range(factors)]       # each (n_used, n_variables)
+        contrib_arr = np.array(contrib)                                  # (n_used, k)
+        success = n_ok / n_scores if n_scores else 0.0
+        names = [self._get_factor_name(i) for i in range(factors)]
+        BootstrapResultsDialog(self.diams, base_F, F_boot_arr, contrib_arr, names, success, n_used, self).exec()
+
     def generate_ini(self, n_rows, n_cols, factors, fpeak, error_fraction=0.1):
         generate_pmf_ini(self.run_dir, n_rows, n_cols, factors, fpeak, error_fraction, task_name="PyNSD") 
 
@@ -1041,6 +1890,14 @@ class PMFPanel(QWidget):
         from gui.pmf_panel import RenameDialog                                   # Double check import path
         dialog = RenameDialog(self.current_factors, self.factor_names, self)
         dialog.exec()
+
+    def open_tracer_loader(self):
+        dialog = TracerLoadDialog(self)
+        if dialog.exec() and dialog.tracer_df is not None:
+            self.tracer_df = dialog.tracer_df
+            cols = ", ".join(str(c) for c in self.tracer_df.columns)
+            self.lbl_tracer.setText(f"Tracers: {cols}  ({len(self.tracer_df)} rows)")
+            self.lbl_tracer.setStyleSheet("color: green;")
 
     def combine_factors(self):
         if self.f_matrix is None or self.g_matrix is None:
