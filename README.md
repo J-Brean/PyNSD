@@ -29,12 +29,17 @@ A statistical module that allows the user to compare and then apply different cl
 ### Nano Ranking
 An evaluative tool which applies the nano-ranking framework of Aliaga et al. (doi: 10.5194/ar-1-81-2023), ranking days by the number of particles in a pre-defined bin.
 
+
+### Wind Sector Analysis
+Vector-averaging of high-resolution wind speed and direction data to generate sector-specific diurnals, contours, and source-apportioned time series.
+
+### Positive Matrix Factorization (PMF) 
+Advanced receptor modelling to identify and quantify the specific sources contributing to the measured aerosol distributions (PMF.exe not included)
+
+
 ## Future Roadmap
 The toolkit is under active development, with the following modules planned for future releases:
 
-Wind Sector Analysis: Vector-averaging of high-resolution wind speed and direction data to generate sector-specific diurnals, contours, and source-apportioned time series.
-
-Positive Matrix Factorization (PMF): Advanced receptor modelling to identify and quantify the specific sources contributing to the measured aerosol distributions (PMF.exe not included)
 
 ## Installation
 It is highly recommended to install PyNSD within a virtual environment to manage dependencies cleanly.
