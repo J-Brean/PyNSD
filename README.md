@@ -5,6 +5,8 @@
 
 PyNSD is a Python-based graphical user interface designed for atmospheric scientists to process, visualise, and analyse Particle Number Size Distributions (PNSD). The toolkit streamlines the entire workflow from raw data (once you've turned it into a csv) to physical and statistical analyses, with a particular focus on New Particle Formation (NPF) events.
 
+### Please read the PyNSD manual pdf!!!
+
 ## Core Modules & Features
 ### Data Import & Processing
 PyNSD features highly robust data handling capabilities designed for messy, real-world atmospheric measurements. Users can load standard time-series PNSD data (in CSV format) and seamlessly merge multiple, disparate datasets. The application automatically handles timestamp alignment, fills missing gaps, and allows users to apply custom data filtering to ensure only high-quality data progresses to the analytical stages.
