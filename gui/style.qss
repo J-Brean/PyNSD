@@ -250,7 +250,37 @@ QLabel#FileName   { font-weight: bold; font-size: 13px; }
 QLabel#FileStatus { color: @muted@; font-size: 12px; }
 QLabel#FileStatus[status="ok"]  { color: #2e7d32; }
 QLabel#FileStatus[status="err"] { color: @destructive@; }
+QLabel#FileStatus[status="warn"] { color: #8a6d1f; }
 QLabel#PreviewIcon {
     background-color: @tan_hover@;
     border-radius: 4px;
 }
+/* ---- Progress ---------------------------------------------------------- */
+QProgressBar {
+    border: 1px solid @border@;
+    border-radius: 7px;
+    background-color: @surface@;
+    height: 14px;
+    text-align: center;
+    font-size: 11px;
+    color: @ink@;
+}
+QProgressBar::chunk {
+    border-radius: 6px;
+    background-color: @tan_active@;
+    margin: 1px;
+}
+QProgressBar#RunBar::chunk {
+    background-color: @primary@;
+}
+
+/* ---- Invalid input ----------------------------------------------------- */
+QLineEdit[invalid="true"] {
+    border: 1px solid @destructive@;
+    background-color: #fdf0ee;
+}
+
+/* ---- Landing, compact type scale for screens under 1500 px ------------ */
+QLabel#LandingTitle[compact="true"] { font-size: 46px; }
+QLabel#LandingSubtitle[compact="true"] { font-size: 18px; }
+QLabel#LandingDescription[compact="true"] { font-size: 15px; }

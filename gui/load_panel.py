@@ -6,21 +6,51 @@ import numpy as np
 import matplotlib.dates as mdates
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
-from scipy.interpolate import interp1d
-from datetime import datetime, timedelta
+from itertools import islice
 import re
+from PyQt6.QtGui import QDragEnterEvent, QDropEvent
 from PyQt6.QtCore import Qt, pyqtSignal, QDate, QPoint
-from PyQt6.QtGui import QFont, QDragEnterEvent, QDropEvent
-from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QFileDialog, QFrame, QGroupBox, QHBoxLayout, 
-                             QHeaderView, QLabel, QLineEdit, QProgressBar, QPushButton, QScrollArea, QSplitter, 
-                             QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget, QDialog, QMessageBox, QInputDialog,
-                             QDateEdit, QSpinBox, QCheckBox, QToolTip)
+from PyQt6.QtWidgets import (QAbstractItemView,
+                             QApplication,
+                             QComboBox,
+                             QGroupBox,
+                             QHBoxLayout,
+                             QLabel,
+                             QLineEdit,
+                             QProgressBar,
+                             QPushButton,
+                             QScrollArea,
+                             QSplitter,
+                             QTableWidget,
+                             QTableWidgetItem,
+                             QVBoxLayout,
+                             QWidget,
+                             QDialog,
+                             QMessageBox,
+                             QInputDialog,
+                             QDateEdit,
+                             QSpinBox,
+                             QCheckBox,
+                             QToolTip)
 from gui.file_entry_widget import FileEntryWidget
-from gui.widgets import CollapsibleSection, make_form
+from gui.widgets import CollapsibleSection, make_form, validate_number
 from gui.theme import (FIELD_MIN_WIDTH, NARROW_FIELD_MIN_WIDTH,
                        SPACE_SM, SPACE_MD, SPACE_LG)
-from utils.data_loader import (DATE_COLUMN_OPTIONS, DATE_FORMAT_OPTIONS, DEFAULT_DATE_COL, DEFAULT_DATE_FMT,
-                               DataFile, load_pnsd_file, apply_qc_filter, calculate_line_losses, align_bins)
+from utils.data_loader import (DATE_COLUMN_OPTIONS,
+                               DATE_FORMAT_OPTIONS,
+                               NA_OPTIONS,
+                               DataFile,
+                               load_pnsd_file,
+                               apply_qc_filter,
+                               calculate_line_losses,
+                               align_bins,
+                               rebin_pnsd)
+from utils.calculations import dlogdp_per_bin, resolve_dlogdp
+from utils.helpers import busy_cursor, fit_to_screen
+from gui import session
+from gui.filedialogs import get_open_file_names, get_save_file_name
+
+DROPPABLE_SUFFIXES = {".csv", ".txt", ".dat", ".tsv", ".xlsx", ".xls", ".xlsm"}
 
 # ─────────────────────────────────────────────────────────────────────────── #
 # Hoverable preview icon label
@@ -49,7 +79,7 @@ class HarmoniseDialog(QDialog):
         self.valid_res_dict = valid_res_dict
         self.target_keys = target_keys
         self.setWindowTitle("Harmonise Diameters (Cubic Spline Check)")
-        self.resize(900, 600)
+        fit_to_screen(self, 900, 600)
         
         layout = QVBoxLayout(self)
         
@@ -96,7 +126,7 @@ class HarmoniseDialog(QDialog):
         ax.set_yscale('log')
         ax.set_xlabel("Diameter (nm)")
         ax.set_ylabel("Mean dN/dlogDp")
-        ax.set_title("Spline Interpolation Check (Mean PNSD)")
+        ax.set_title("Rebinning check (mean PNSD)")
         
         for path in self.target_keys:
             data = self.valid_res_dict[path]
@@ -107,22 +137,16 @@ class HarmoniseDialog(QDialog):
             p = ax.plot(o_diams, mean_raw, 'o', alpha=0.6, label=f"{Path(path).name} (Raw)")
             
             if path == target_path or np.array_equal(o_diams, t_diams):
-                ax.plot(o_diams, mean_raw, '-', color=p[0].get_color(), lw=2, alpha=0.5, label=f"{Path(path).name} (Target Spline)")
+                ax.plot(o_diams, mean_raw, '-', color=p[0].get_color(), lw=2, alpha=0.5, label=f"{Path(path).name} (Target)")
                 continue
-            
-            # Clean the raw mean for a stable 1D spline plot
-            valid_mask = ~np.isnan(mean_raw)
-            if not valid_mask.any(): continue
-            clean_o_diams = o_diams[valid_mask]
-            clean_mean = mean_raw[valid_mask]
-            
+
+            # Preview exactly what the button will do, rather than a different curve.
             try:
-                f = interp1d(clean_o_diams, clean_mean, kind='cubic', bounds_error=False, fill_value=np.nan)
-                mean_new = f(t_diams)
-                # Plot the new spline curve over the target bin range
-                ax.plot(t_diams, mean_new, '-', color=p[0].get_color(), lw=2, label=f"{Path(path).name} (Spline)")
+                rebinned = rebin_pnsd(pd.DataFrame([mean_raw], columns=o_diams), o_diams, t_diams)
+                ax.plot(t_diams, rebinned.to_numpy()[0], '-', color=p[0].get_color(), lw=2,
+                        label=f"{Path(path).name} (Rebinned)")
             except Exception as e:
-                print(f"Plot spline failed for {path}: {e}")
+                print(f"Rebinning preview failed for {path}: {e}")
                 
         ax.legend(fontsize=8)
         self.fig.tight_layout()
@@ -143,7 +167,7 @@ class DateTimeFilterDialog(QDialog):
         self.mask = pd.Series(True, index=df.index)
         
         self.setWindowTitle("Filter by Date/Time")
-        self.resize(900, 650)
+        fit_to_screen(self, 900, 650)
         
         layout = QVBoxLayout(self)
         
@@ -363,10 +387,6 @@ class DateTimeFilterDialog(QDialog):
     def get_filtered_data(self):
         """Return the filtered DataFrame."""
         return self.df[self.mask]
-    
-    def get_mask(self):
-        """Return the filter mask."""
-        return self.mask
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -379,7 +399,7 @@ class DiameterFilterDialog(QDialog):
         self.diams = np.array(diams, dtype=float)
 
         self.setWindowTitle("Filter Diameters")
-        self.resize(900, 620)
+        fit_to_screen(self, 900, 620)
 
         layout = QVBoxLayout(self)
 
@@ -387,13 +407,13 @@ class DiameterFilterDialog(QDialog):
         ctrl.addWidget(QLabel("Min Dp (nm):"))
         self.min_input = QLineEdit(f"{self.diams.min():.2f}")
         self.min_input.setFixedWidth(90)
-        self.min_input.textChanged.connect(self.update_plot)
+        self.min_input.editingFinished.connect(self.update_plot)
         ctrl.addWidget(self.min_input)
 
         ctrl.addWidget(QLabel("Max Dp (nm):"))
         self.max_input = QLineEdit(f"{self.diams.max():.2f}")
         self.max_input.setFixedWidth(90)
-        self.max_input.textChanged.connect(self.update_plot)
+        self.max_input.editingFinished.connect(self.update_plot)
         ctrl.addWidget(self.max_input)
         ctrl.addStretch()
         layout.addLayout(ctrl)
@@ -488,8 +508,10 @@ def detect_timezone_from_csv(file_path: str) -> str | None:
     tz_in_datetime = re.compile(r'\d{2}([+-])(\d{2}):?(\d{2})$')
     try:
         with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-            for line in f:
-                for token in line.split(','):
+            # An offset, if there is one, is in the first data rows. Reading the
+            # whole file here cost a full extra pass over every load.
+            for line in islice(f, 200):
+                for token in re.split(r'[,;\t]', line):
                     token = token.strip().strip('"').strip("'")
                     m = tz_in_datetime.search(token)
                     if m:
@@ -512,9 +534,9 @@ class LoadPanel(QWidget):
         self._results: dict[str, DataFile] = {}
         self._selected_paths: set[str] = set()
         self._active_preview_path: str | None = None
-        self._merged_df = None
-        self._merged_diams = None
-        
+        self._undo_stack: list = []
+
+        self.setAcceptDrops(True)                    # files can be dropped straight on
         self._build_ui()
         self.setAcceptDrops(True)
 
@@ -605,6 +627,9 @@ class LoadPanel(QWidget):
         clear_btn.setProperty("class", "destructive")
         clear_btn.clicked.connect(self._clear_all)
         file_row.addWidget(clear_btn)
+        drop_hint = QLabel("…or drag files onto this panel")
+        drop_hint.setObjectName("FileStatus")
+        file_row.addWidget(drop_hint)
         file_row.addStretch()
         body.addLayout(file_row)
 
@@ -657,8 +682,7 @@ class LoadPanel(QWidget):
 
         self._fmt_combo = QComboBox()
         self._fmt_combo.setMinimumWidth(FIELD_MIN_WIDTH)
-        sorted_fmts = sorted(DATE_FORMAT_OPTIONS, key=lambda x: 0 if str(x[0]).upper().startswith('Y') else (1 if str(x[0]).upper().startswith('D') else 2))
-        for disp, _ in sorted_fmts: self._fmt_combo.addItem(disp)
+        for disp, _ in DATE_FORMAT_OPTIONS: self._fmt_combo.addItem(disp)
         self._fmt_combo.currentIndexChanged.connect(self._on_fmt_changed)
         self._custom_fmt = QLineEdit()
         self._custom_fmt.setPlaceholderText("e.g., yyyy/MM/dd HH:mm:ss")
@@ -684,7 +708,7 @@ class LoadPanel(QWidget):
 
         self._na_combo = QComboBox()
         self._na_combo.setMinimumWidth(FIELD_MIN_WIDTH)
-        self._na_combo.addItems(["Drop Rows", "Fill (Fwd/Bwd)", "Interpolate", "Fill Min (1e0)"])
+        self._na_combo.addItems([label for label, _ in NA_OPTIONS])
         form.addRow("Missing data", self._field_row(
             self._na_combo,
             self._info_btn("How to handle missing data.\nDrop: Removes the row.\nFill: Copies last valid value.\nInterpolate: Draws a line.\nFill Min: Replaces with 1e0.", "Missing Data Handling")))
@@ -720,6 +744,11 @@ class LoadPanel(QWidget):
         body.addLayout(apply_row)
 
         sec.set_content_layout(body)
+
+
+        # Red outline while a box holds something unusable.
+        validate_number(self._resample_val, minimum=1, integer=True)
+
         return sec
 
     # ── Section 2 · Corrections & QC ─────────────────────────────────── #
@@ -835,7 +864,27 @@ class LoadPanel(QWidget):
         filt_layout.addStretch()
         body.addWidget(filt_box)
 
+        # --- Undo ---
+        undo_row = QHBoxLayout()
+        self._undo_btn = QPushButton("↶ Undo last correction")
+        self._undo_btn.setEnabled(False)
+        self._undo_btn.clicked.connect(self._undo_correction)
+        undo_row.addWidget(self._undo_btn)
+        self._undo_lbl = QLabel("No corrections applied yet.")
+        self._undo_lbl.setObjectName("FileStatus")
+        undo_row.addWidget(self._undo_lbl)
+        undo_row.addStretch()
+        body.addLayout(undo_row)
+
         sec.set_content_layout(body)
+
+        # Red outline while a box holds something unusable.
+        validate_number(self._qc_win, minimum=2, integer=True)
+        validate_number(self._qc_thresh, minimum=0)
+        validate_number(self._floor_thresh)
+        validate_number(self._ceil_thresh)
+        validate_number(self._norm_dlogdp, minimum=0, maximum=2)
+
         return sec
 
     # ── Section 3 · Combine & proceed ────────────────────────────────── #
@@ -918,17 +967,45 @@ class LoadPanel(QWidget):
         self._custom_fmt.setVisible(val == "custom")
 
     def _browse_files(self):
-        paths, _ = QFileDialog.getOpenFileNames(self, "Select PNSD files", "", "Data (*.csv *.xlsx *.xls *.txt *.dat *.tsv)")
-        if not paths: return
-        
+        paths, _ = get_open_file_names(self, "Select PNSD files", "", "Data (*.csv *.xlsx *.xls *.txt *.dat *.tsv)")
+        self._add_files(paths)
+
+    def _add_files(self, paths):
+        """Load a list of files, whether chosen in the dialog or dropped on the panel."""
+        if not paths:
+            return
+        session.remember_recent(paths)
+
         self.progress_bar.setVisible(True)
         self.progress_bar.setMaximum(len(paths))
-        for i, path in enumerate(paths):
-            self._inject_file_to_list(path)
-            self._parse_and_update(path)
-            self.progress_bar.setValue(i + 1)
-            QApplication.processEvents()
+        with busy_cursor():
+            for i, path in enumerate(paths):
+                self._inject_file_to_list(path)
+                self._parse_and_update(path)
+                self.progress_bar.setValue(i + 1)
+                QApplication.processEvents()
         self.progress_bar.setVisible(False)
+        self._save_session()
+
+    # ---- Dropping files straight onto the panel -------------------------- #
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if event.mimeData().hasUrls() and any(self._is_data_file(u) for u in event.mimeData().urls()):
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event: QDragEnterEvent):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event: QDropEvent):
+        paths = [u.toLocalFile() for u in event.mimeData().urls() if self._is_data_file(u)]
+        if paths:
+            event.acceptProposedAction()
+            self._add_files(paths)
+
+    @staticmethod
+    def _is_data_file(url) -> bool:
+        return (url.isLocalFile()
+                and Path(url.toLocalFile()).suffix.lower() in DROPPABLE_SUFFIXES)
 
     def _inject_file_to_list(self, path: str):
         if path not in self._entries:
@@ -1013,8 +1090,7 @@ class LoadPanel(QWidget):
         g_flag_col = self._flag_col.text().strip()
         g_flag_val = self._flag_val.text().strip() or "1"
         
-        na_map = {"Drop Rows": "drop", "Fill (Fwd/Bwd)": "ffill", "Interpolate": "interpolate", "Fill Min (1e0)": "zero"}
-        na_method = na_map.get(na_text, "drop")
+        na_method = dict(NA_OPTIONS).get(na_text, "drop")
         
         resample_rule = None
         if res_val.isdigit():
@@ -1091,10 +1167,7 @@ class LoadPanel(QWidget):
         num_replaced = (df < threshold).sum().sum()                                                                      
         df_floored = df.clip(lower=threshold)                                                                            
         
-        if self._active_preview_path == "MERGED": self._merged_df = df_floored                                           
-        else: self._results[self._active_preview_path].df = df_floored                                                   
-            
-        self._populate_preview(df_floored, diams, f"Values < {threshold} floored")                                       
+        self._apply_correction(df_floored, f"Values < {threshold} floored")
         QMessageBox.information(self, "Sorted!", f"Successfully replaced {num_replaced} values that were below {threshold}. 🧹") 
 
     def _run_ceil_threshold(self): 
@@ -1106,10 +1179,7 @@ class LoadPanel(QWidget):
         num_replaced = (df > threshold).sum().sum() 
         df_ceiled = df.clip(upper=threshold) 
         
-        if self._active_preview_path == "MERGED": self._merged_df = df_ceiled 
-        else: self._results[self._active_preview_path].df = df_ceiled 
-        
-        self._populate_preview(df_ceiled, diams, f"Values > {threshold} ceiling applied") 
+        self._apply_correction(df_ceiled, f"Values > {threshold} ceiling applied")
         QMessageBox.information(self, "Sorted!", f"Successfully replaced {num_replaced} values that were above {threshold}. 🧹") 
 
     def _update_merge_buttons(self):
@@ -1151,15 +1221,11 @@ class LoadPanel(QWidget):
                 if np.array_equal(o_diams, t_diams):
                     harmonised_dfs[path] = data.df.copy()
                     continue
-                
-                # Math safe interpolation strictly for the spline application
-                df_clean = data.df.interpolate(method='linear', axis=1, limit_direction='both').fillna(1e-4)
+
                 try:
-                    f = interp1d(o_diams, df_clean.values, axis=1, kind='cubic', bounds_error=False, fill_value=np.nan)
-                    new_vals = f(t_diams)
-                    harmonised_dfs[path] = pd.DataFrame(new_vals, index=data.df.index, columns=t_diams)
+                    harmonised_dfs[path] = rebin_pnsd(data.df, o_diams, t_diams)
                 except Exception as e:
-                    QMessageBox.warning(self, "Spline Error", f"Failed to harmonise {Path(path).name}:\n{e}")
+                    QMessageBox.warning(self, "Rebinning Error", f"Failed to harmonise {Path(path).name}:\n{e}")
                     harmonised_dfs[path] = None
 
             # --- Out of Range (OOR) Handler ---
@@ -1192,16 +1258,113 @@ class LoadPanel(QWidget):
             QMessageBox.information(self, "Success", "Datasets harmonised successfully! 📏")
 
     def _get_active_data(self):
-        if self._active_preview_path == "MERGED": return self._merged_df, self._merged_diams
         res = self._results.get(self._active_preview_path)
         if res and res.ok: return res.df, res.diameters
         return None, None
 
+    # ---- Session ---------------------------------------------------------- #
+    def import_settings(self) -> dict:
+        """The global import settings, as plain values that can be stored."""
+        return {
+            "date_col": self._col_combo.currentText(),
+            "custom_col": self._custom_col.text(),
+            "date_fmt": self._fmt_combo.currentText(),
+            "custom_fmt": self._custom_fmt.text(),
+            "timezone": self._tz_input.text(),
+            "resample_val": self._resample_val.text(),
+            "resample_unit": self._resample_unit.currentText(),
+            "na": self._na_combo.currentText(),
+            "drop_cols": self._drop_cols.text(),
+            "flag_col": self._flag_col.text(),
+            "flag_val": self._flag_val.text(),
+        }
+
+    def apply_import_settings(self, saved: dict) -> None:
+        """Put stored settings back into the boxes, ignoring anything unknown."""
+        pairs = [
+            (self._col_combo.setCurrentText, "date_col"), (self._custom_col.setText, "custom_col"),
+            (self._fmt_combo.setCurrentText, "date_fmt"), (self._custom_fmt.setText, "custom_fmt"),
+            (self._tz_input.setText, "timezone"), (self._resample_val.setText, "resample_val"),
+            (self._resample_unit.setCurrentText, "resample_unit"), (self._na_combo.setCurrentText, "na"),
+            (self._drop_cols.setText, "drop_cols"), (self._flag_col.setText, "flag_col"),
+            (self._flag_val.setText, "flag_val"),
+        ]
+        for setter, key in pairs:
+            if key in saved:
+                setter(saved[key])
+
+    def loaded_paths(self) -> list[str]:
+        return [p for p in self._results if not p.startswith("MERGED_")]
+
+    def _save_session(self, confirmed: bool = False) -> None:
+        paths = self.loaded_paths()
+        if not paths:
+            session.clear()
+            return
+        session.save(files=[{"path": p} for p in paths],
+                     settings=self.import_settings(),
+                     confirmed=confirmed,
+                     corrections=[step[4] for step in self._undo_stack])
+
+    def restore_session(self, payload: dict) -> None:
+        """Re-open the files and settings from a previous run."""
+        self.apply_import_settings(payload.get("settings", {}))
+        self._add_files([f["path"] for f in payload.get("files", [])])
+
     def _update_dlogdp_box(self, diams: list):
         if not diams: return
-        log_diams = np.log10(diams)
-        dlogdp = np.mean(np.diff(log_diams)) if len(log_diams) > 1 else 1.0
-        self._norm_dlogdp.setText(f"{dlogdp:.4f}")
+        self._norm_dlogdp.setText(f"{float(np.mean(dlogdp_per_bin(diams))):.4f}")
+
+    # ---- Corrections, and taking them back ------------------------------- #
+    def _apply_correction(self, new_df: pd.DataFrame, label: str, diams: list | None = None):
+        """Write a corrected frame back to the active dataset, keeping the old one.
+
+        Corrections compound if applied twice (normalise, line loss, floor), so
+        every one of them has to be reversible.
+        """
+        res = self._results.get(self._active_preview_path)
+        if res is None:
+            return None
+
+        self._undo_stack.append((self._active_preview_path, res.df, list(res.diameters), res.n_bins, label))
+        del self._undo_stack[:-20]                                   # a sane depth, not unbounded memory
+
+        res.df = new_df
+        if diams is not None:
+            res.diameters = list(diams)
+            res.n_bins = len(diams)
+            self._update_dlogdp_box(res.diameters)
+
+        self._refresh_undo_state()
+        entry = self._entries.get(self._active_preview_path)
+        if entry:
+            entry.set_result(res)
+        self._populate_preview(res.df, res.diameters, label)
+        return res
+
+    def _undo_correction(self):
+        if not self._undo_stack:
+            return
+        path, df, diams, n_bins, label = self._undo_stack.pop()
+        res = self._results.get(path)
+        if res is None:
+            return
+
+        res.df, res.diameters, res.n_bins = df, diams, n_bins
+        self._active_preview_path = path
+        self._update_dlogdp_box(diams)
+        self._refresh_undo_state()
+        entry = self._entries.get(path)
+        if entry:
+            entry.set_result(res)
+        self._populate_preview(df, diams, f"Undone: {label}")
+
+    def _refresh_undo_state(self):
+        self._undo_btn.setEnabled(bool(self._undo_stack))
+        if self._undo_stack:
+            self._undo_lbl.setText(f"Last: {self._undo_stack[-1][4]}  ({len(self._undo_stack)} step(s) held)")
+        else:
+            self._undo_lbl.setText("No corrections applied yet.")
 
     def _run_qc(self):
         df, diams = self._get_active_data()
@@ -1214,10 +1377,7 @@ class LoadPanel(QWidget):
         act = "na" if "NA" in self._qc_action.currentText() else "mean"
         df_clean, num_corrected, outliers = apply_qc_filter(df, win, thresh, act)
         
-        if self._active_preview_path == "MERGED": self._merged_df = df_clean
-        else: self._results[self._active_preview_path].df = df_clean
-        
-        self._populate_preview(df_clean, diams, "QC Filter Applied")
+        self._apply_correction(df_clean, "QC filter applied")
         QMessageBox.information(self, "QC Complete", f"Identified and corrected {num_corrected} anomalous data points.")
         self._show_qc_diagnostic_plot(df, df_clean, diams)
 
@@ -1229,10 +1389,9 @@ class LoadPanel(QWidget):
         canvas = FigureCanvasQTAgg(fig)
         ax = fig.add_subplot(111)
         
-        log_diams = np.log10(diams)
-        dlogdp = np.mean(np.diff(log_diams)) if len(log_diams) > 1 else 1.0
-        raw_n = df_raw.sum(axis=1) * dlogdp
-        clean_n = df_clean.sum(axis=1) * dlogdp
+        dlogdp = dlogdp_per_bin(diams)
+        raw_n = (df_raw * dlogdp).sum(axis=1)
+        clean_n = (df_clean * dlogdp).sum(axis=1)
         dates = mdates.date2num(df_raw.index)
         
         ax.plot(dates, raw_n, 'r-', alpha=0.5, label="Raw (Flagged spikes in red)")
@@ -1257,10 +1416,7 @@ class LoadPanel(QWidget):
         pen = calculate_line_losses(np.array(diams), L, ID, T, Q)
         corrected_df = df.div(pen, axis=1)
         
-        if self._active_preview_path == "MERGED": self._merged_df = corrected_df
-        else: self._results[self._active_preview_path].df = corrected_df
-            
-        self._populate_preview(corrected_df, diams, "Line Loss Corrected")
+        self._apply_correction(corrected_df, "Line loss corrected")
         self._show_line_loss_plot(diams, pen, df.mean(), corrected_df.mean())
 
     def _show_line_loss_plot(self, diams, pen, mean_raw, mean_corr):
@@ -1286,27 +1442,23 @@ class LoadPanel(QWidget):
     def _run_normalise(self):
         df, diams = self._get_active_data()
         if df is None: return
-        try: val = float(self._norm_dlogdp.text())
+        try: float(self._norm_dlogdp.text())
         except ValueError: return
-        
-        new_df = df / val
-        if self._active_preview_path == "MERGED": self._merged_df = new_df
-        else: self._results[self._active_preview_path].df = new_df
-        
-        self._populate_preview(new_df, diams, "Normalised (dN/dlogDp)")
+        widths = resolve_dlogdp(diams, self._norm_dlogdp.text())          # per-bin unless overridden
+
+        new_df = df / widths
+        self._apply_correction(new_df, "Normalised (dN/dlogDp)")
         QMessageBox.information(self, "Yeehaw!", "Data successfully normalised to dN/dlogDp! 🤠🚀")
 
     def _run_unnormalise(self):
         df, diams = self._get_active_data()
         if df is None: return
-        try: val = float(self._norm_dlogdp.text())
+        try: float(self._norm_dlogdp.text())
         except ValueError: return
-        
-        new_df = df * val
-        if self._active_preview_path == "MERGED": self._merged_df = new_df
-        else: self._results[self._active_preview_path].df = new_df
-        
-        self._populate_preview(new_df, diams, "Un-normalised (dN)")
+        widths = resolve_dlogdp(diams, self._norm_dlogdp.text())
+
+        new_df = df * widths
+        self._apply_correction(new_df, "Un-normalised (dN)")
         QMessageBox.information(self, "Yeehaw!", "Data successfully converted back to N! (No normalisation) 🤠🐎")
 
     def _run_datetime_filter(self):
@@ -1320,12 +1472,7 @@ class LoadPanel(QWidget):
             filtered_df = dlg.get_filtered_data()
             n_removed = len(df) - len(filtered_df)
             
-            if self._active_preview_path == "MERGED": 
-                self._merged_df = filtered_df
-            else: 
-                self._results[self._active_preview_path].df = filtered_df
-            
-            self._populate_preview(filtered_df, diams, f"Date/Time Filtered ({n_removed} rows removed)")
+            self._apply_correction(filtered_df, f"Date/time filtered ({n_removed} rows removed)")
             QMessageBox.information(self, "Filter Applied", f"Successfully filtered data. Removed {n_removed} rows. ✂️")
 
     def _run_diameter_filter(self):
@@ -1349,17 +1496,7 @@ class LoadPanel(QWidget):
             filtered_df = df.loc[:, keep_cols].copy()
             kept_diams = [float(d) for d in np.array(diams, dtype=float)[keep_mask]]
 
-            if self._active_preview_path and self._active_preview_path.startswith("MERGED_"):
-                self._results[self._active_preview_path].df = filtered_df
-                self._results[self._active_preview_path].diameters = kept_diams
-                self._results[self._active_preview_path].n_bins = len(kept_diams)
-            elif self._active_preview_path in self._results:
-                self._results[self._active_preview_path].df = filtered_df
-                self._results[self._active_preview_path].diameters = kept_diams
-                self._results[self._active_preview_path].n_bins = len(kept_diams)
-
-            self._update_dlogdp_box(kept_diams)
-            self._populate_preview(filtered_df, kept_diams, f"Diameter filtered ({len(kept_diams)} bins kept)")
+            self._apply_correction(filtered_df, f"Diameter filtered ({len(kept_diams)} bins kept)", kept_diams)
             QMessageBox.information(self, "Filter Diameters", f"Kept {len(kept_diams)} diameter bins.")
 
     def _execute_merge(self, mode: str):
@@ -1394,8 +1531,20 @@ class LoadPanel(QWidget):
                 merged_df = pd.concat(aligned_dfs).sort_index()
                 final_diams = base_diams
         else:
+            # Appending files with different bins yields the union of both bin
+            # sets, half NaN and out of size order, which quietly breaks every
+            # calculation that assumes ascending diameters.
+            base_diams = list(valid_res[0].diameters)
+            odd = [r.path.name for r in valid_res[1:] if list(r.diameters) != base_diams]
+            if odd:
+                QMessageBox.warning(
+                    self, "Size bins do not match",
+                    f"{', '.join(odd)} does not use the same size bins as "
+                    f"{valid_res[0].path.name}.\n\nHarmonise the files onto a common "
+                    "bin set first, or use Splice to join two instruments.")
+                return
             merged_df = pd.concat([r.df for r in valid_res]).sort_index()
-            final_diams = np.array([float(c) for c in merged_df.columns if pd.notna(c)])
+            final_diams = np.array(base_diams)
 
         merged_df = merged_df[merged_df.index.notna()] 
         merged_df = merged_df[merged_df.index.year > 1990]
@@ -1420,7 +1569,7 @@ class LoadPanel(QWidget):
     def _export_csv(self):
         df, _ = self._get_active_data()
         if df is None: return
-        path, _ = QFileDialog.getSaveFileName(self, "Export Dataset", "", "CSV (*.csv)")
+        path, _ = get_save_file_name(self, "Export Dataset", "", "CSV (*.csv)")
         if path: df.to_csv(path)
 
     def _populate_preview(self, df: pd.DataFrame | None, diams: list, title: str):
@@ -1460,7 +1609,8 @@ class LoadPanel(QWidget):
 
         ok_res = {p: self._results[p] for p in target_keys if self._results.get(p) and self._results[p].ok}
         
-        if ok_res: 
+        if ok_res:
+            self._save_session(confirmed=True)
             self.data_confirmed.emit(ok_res)
         else:
             QMessageBox.warning(self, "Invalid Data", "The selected file(s) contain errors and cannot be used.")

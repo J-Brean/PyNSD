@@ -1,6 +1,5 @@
 import math
 import numpy as np
-import pandas as pd
 from scipy import stats
 from statsmodels.tsa.seasonal import seasonal_decompose
 import matplotlib.dates as mdates
@@ -8,11 +7,23 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.colors import LogNorm
 from matplotlib import rcParams
-from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
-                             QLabel, QLineEdit, QComboBox, QSplitter,
-                             QPushButton, QTextEdit, QScrollArea, QCheckBox,
-                             QFileDialog, QMessageBox, QDialog)
+from PyQt6.QtWidgets import (QWidget,
+                             QVBoxLayout,
+                             QHBoxLayout,
+                             QLabel,
+                             QLineEdit,
+                             QComboBox,
+                             QSplitter,
+                             QPushButton,
+                             QTextEdit,
+                             QScrollArea,
+                             QCheckBox,
+                             QMessageBox,
+                             QDialog)
 from PyQt6.QtCore import Qt
+from utils.helpers import fit_to_screen
+from utils.calculations import dlogdp_per_bin, integrate_pnsd
+from gui.filedialogs import get_save_file_name
 
 rcParams['font.family'] = 'serif'
 rcParams['font.serif'] = ['Georgia', 'Times New Roman']
@@ -55,7 +66,7 @@ class ExportDialog(QDialog):
         
         w = int(fig.get_figwidth() * fig.dpi)
         h = int(fig.get_figheight() * fig.dpi) + 50
-        self.resize(w, h)
+        fit_to_screen(self, w, h)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -65,12 +76,12 @@ class ExportDialog(QDialog):
     def apply_size(self):
         try:
             w, h = int(self.val_w.text()), int(self.val_h.text())
-            self.resize(w, h + 50)
+            fit_to_screen(self, w, h + 50)
         except ValueError:
             pass
 
     def save_plot(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Save Plot", "", "PNG Files (*.png);;PDF Files (*.pdf);;SVG Files (*.svg)")
+        path, _ = get_save_file_name(self, "Save Plot", "", "PNG Files (*.png);;PDF Files (*.pdf);;SVG Files (*.svg)")
         if path:
             w_in = self.canvas.width() / self.fig.dpi
             h_in = self.canvas.height() / self.fig.dpi
@@ -225,8 +236,7 @@ class TrendPanel(QWidget):
         
         if not bin_ranges: return
         
-        log_diams = np.log10(self.diams)
-        dlogdp = np.mean(np.diff(log_diams)) if len(log_diams) > 1 else 1.0
+        dlogdp = dlogdp_per_bin(self.diams)                 # per-bin widths, not one mean
         calc_mass = self.chk_mass.isChecked()
         
         resample_map = {"Hourly": "h", "Daily": "D", "Monthly": "ME"}
@@ -237,8 +247,7 @@ class TrendPanel(QWidget):
             mask = (self.diams >= dmin) & (self.diams <= dmax)
             if not np.any(mask): continue
             
-            n_cm3 = self.df.iloc[:, mask] * dlogdp
-            subset_num = n_cm3.sum(axis=1)
+            subset_num = (self.df.iloc[:, mask] * dlogdp[mask]).sum(axis=1)
             
             if avg_choice in resample_map:
                 subset_num = subset_num.resample(resample_map[avg_choice]).mean().dropna()
@@ -249,7 +258,7 @@ class TrendPanel(QWidget):
         if calc_mass:
             d_m = self.diams * 1e-9
             vol_m3 = (np.pi / 6.0) * (d_m ** 3)
-            mass_kg = (self.df * dlogdp) * 1e6 * vol_m3 * 1.5e3
+            mass_kg = (self.df * dlogdp) * 1e6 * vol_m3 * 1.5e3          # dlogdp is per-bin
             total_mass_ug = (mass_kg * 1e9).sum(axis=1)
             
             if avg_choice in resample_map:
@@ -391,7 +400,7 @@ class TrendPanel(QWidget):
         for name, group in groups:
             diurnal = group.groupby(group.index.hour).mean()
             v_max = max(v_max, diurnal.to_numpy().max())
-            tot_n = np.sum(diurnal.to_numpy(), axis=1) * dlogdp
+            tot_n = integrate_pnsd(diurnal.to_numpy(), dlogdp)
             max_tot_n = max(max_tot_n, tot_n.max())
             diurnals.append((name, diurnal, tot_n))
             

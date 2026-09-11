@@ -3,7 +3,8 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QMouseEvent
 from PyQt6.QtWidgets import (QFrame, QHBoxLayout, QVBoxLayout, QLabel, QPushButton, 
                              QGroupBox, QComboBox, QLineEdit, QGridLayout)
-from utils.data_loader import DATE_COLUMN_OPTIONS, DATE_FORMAT_OPTIONS, DataFile
+from gui.theme import repolish
+from utils.data_loader import DATE_COLUMN_OPTIONS, DATE_FORMAT_OPTIONS, NA_OPTIONS, DataFile
 
 class FileEntryWidget(QFrame):
     removed = pyqtSignal(str)
@@ -83,7 +84,7 @@ class FileEntryWidget(QFrame):
 
         grid.addWidget(QLabel("NAs:"), 2, 2)
         self.na_combo = QComboBox()
-        self.na_combo.addItems(["Drop Rows", "Fill (Fwd/Bwd)", "Interpolate", "Fill Min (1e-4)"])
+        self.na_combo.addItems([label for label, _ in NA_OPTIONS])
         grid.addWidget(self.na_combo, 2, 3)
 
         # Avg & Drop Cols
@@ -113,20 +114,32 @@ class FileEntryWidget(QFrame):
 
     def set_selected_style(self, selected: bool):
         self.setProperty("selected", "true" if selected else "false")
-        self.style().unpolish(self)
-        self.style().polish(self)
+        repolish(self)
 
     def set_result(self, result: DataFile):
-        if result.ok:
-            status_text = f"✓ {result.size_str} | {result.n_rows} rows | {result.n_bins} bins"
-            self.lbl_status.setProperty("status", "ok")
-        else:
+        if not result.ok:
             status_text = "❌ Error"
             self.lbl_status.setProperty("status", "err")
+            self.lbl_status.setToolTip(result.error or "Unknown error")
+        else:
+            status_text = f"✓ {result.size_str} | {result.n_rows} rows | {result.n_bins} bins"
+            self.lbl_status.setProperty("status", "ok")
+
+            tip = [f"{result.date_range_str}   {result.diam_range_str}"]
+
+            # Every assumption the loader made is worth seeing: a converted unit
+            # or a dropped row changes the science, so it must not stay silent.
+            # Routine detections stay in the tooltip; only changes to the data
+            # itself earn the warning badge.
+            alerts = [n for n in result.notes if n.startswith("⚠")]
+            if alerts:
+                status_text += f"  ⚠ {len(alerts)}"
+                self.lbl_status.setProperty("status", "warn")
+            tip += [f"• {n}" for n in result.notes]
+            self.lbl_status.setToolTip("\n".join(tip))
 
         self.lbl_status.setText(status_text)
-        self.lbl_status.style().unpolish(self.lbl_status)
-        self.lbl_status.style().polish(self.lbl_status)
+        repolish(self.lbl_status)
 
     # --- Effective Value Methods ---
     def overrides_active(self) -> bool:

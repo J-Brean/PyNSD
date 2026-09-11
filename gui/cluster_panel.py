@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import math
 import warnings
-from io import StringIO
 
 import numpy as np
 import pandas as pd
@@ -37,12 +36,27 @@ from sklearn.decomposition import PCA
 from sklearn.metrics import calinski_harabasz_score, davies_bouldin_score, silhouette_score
 from sklearn.preprocessing import MinMaxScaler, RobustScaler, StandardScaler
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, 
-                             QFileDialog, QGroupBox, QHBoxLayout, QLabel, 
-                             QLineEdit, QProgressBar, QPushButton, QScrollArea, 
-                             QSplitter, QTabWidget, QTextEdit, QVBoxLayout, 
-                             QWidget, QDialog, QMessageBox)
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import (QApplication,
+                             QCheckBox,
+                             QComboBox,
+                             QGroupBox,
+                             QHBoxLayout,
+                             QLabel,
+                             QLineEdit,
+                             QPushButton,
+                             QScrollArea,
+                             QTabWidget,
+                             QTextEdit,
+                             QVBoxLayout,
+                             QWidget,
+                             QDialog,
+                             QMessageBox)
+from gui.widgets import RunProgress, validate_number
+from gui.workers import CancellableWorker
+from utils.helpers import fit_to_screen
+from utils.calculations import dlogdp_per_bin, integrate_pnsd
+from gui.filedialogs import get_save_file_name
 
 # ── Matplotlib global style ─────────────────────────────────────────────── #
 rcParams['font.family'] = 'serif'
@@ -56,6 +70,10 @@ rcParams['savefig.facecolor'] = '#fff1e5'
 _FT_BG = '#fff1e5'
 _ACCENT_COLORS = ['#0f6e56', '#185fa5', '#854f0b', '#a32d2d',
                   '#533ab7', '#3b6d11', '#854f0b', '#4b1528', '#202020']
+
+# Daily-mode clustering compares whole diurnal cycles, so a day has to be
+# nearly complete before it can join one.
+MIN_HOURS_PER_DAY = 20
 
 # --- Custom Export Dialog ---
 class ExportDialog(QDialog):
@@ -90,7 +108,7 @@ class ExportDialog(QDialog):
         
         w = int(fig.get_figwidth() * fig.dpi)
         h = int(fig.get_figheight() * fig.dpi) + 50
-        self.resize(w, h)
+        fit_to_screen(self, w, h)
 
     def save_plot(self):
         try:
@@ -99,7 +117,7 @@ class ExportDialog(QDialog):
         except ValueError:
             pass
             
-        path, _ = QFileDialog.getSaveFileName(self, "Save Plot", "", "PNG Files (*.png);;PDF Files (*.pdf);;SVG Files (*.svg)")
+        path, _ = get_save_file_name(self, "Save Plot", "", "PNG Files (*.png);;PDF Files (*.pdf);;SVG Files (*.svg)")
         if path:
             self.fig.savefig(path, dpi=300, bbox_inches='tight', facecolor='white')
             self.accept()
@@ -113,29 +131,23 @@ class ExportDialog(QDialog):
 # Background worker thread
 # ─────────────────────────────────────────────────────────────────────────── #
 
-class ClusterWorker(QThread):
-    finished = pyqtSignal(object)
-    error    = pyqtSignal(str)
-    progress = pyqtSignal(str)
+def _no_progress(done, total, message=""):
+    """Default when a compute helper is called outside a worker."""
+
+
+class ClusterWorker(CancellableWorker):
+    """Runs one compare/tune/cluster job, reporting progress and stoppable."""
 
     def __init__(self, task: str, kwargs: dict):
         super().__init__()
         self.task   = task
         self.kwargs = kwargs
 
-    def run(self):
-        try:
-            if self.task == "compare":
-                result = _run_compare(**self.kwargs)
-            elif self.task == "tune":
-                result = _run_tune(**self.kwargs)
-            elif self.task == "cluster":
-                result = _run_cluster(**self.kwargs)
-            else:
-                raise ValueError(f"Unknown task: {self.task}")
-            self.finished.emit(result)
-        except Exception as exc:
-            self.error.emit(str(exc))
+    def work(self):
+        jobs = {"compare": _run_compare, "tune": _run_tune, "cluster": _run_cluster}
+        if self.task not in jobs:
+            raise ValueError(f"Unknown task: {self.task}")
+        return jobs[self.task](progress=self.tick, **self.kwargs)
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -223,11 +235,13 @@ def _score(X: np.ndarray, labels: np.ndarray) -> dict:
     return {"silhouette": sil, "calinski": cal, "davies": dav}
 
 
-def _run_compare(X_raw, k, scaler, dim_method, dim_n, models):
+def _run_compare(X_raw, k, scaler, dim_method, dim_n, models, progress=_no_progress):
+    progress(0, len(models) + 1, "Scaling and reducing…")
     X = _scale(X_raw, scaler)
     X = _dim_reduce(X, dim_method, dim_n)
     rows = []
-    for name in models:
+    for i, name in enumerate(models):
+        progress(i + 1, len(models) + 1, f"Fitting {name}…")
         labels = _fit_model(name, X, k=k)
         s = _score(X, labels)
         n_clusters = len(set(labels[labels >= 0]))
@@ -262,14 +276,16 @@ def _fit_model(name: str, X: np.ndarray, k: int, eps: float = 0.5,
     raise ValueError(f"Unknown model: {name}")
 
 
-def _run_tune(X_raw, scaler, dim_method, dim_n, model, k_min, k_max, eps_min, eps_max, eps_steps):
+def _run_tune(X_raw, scaler, dim_method, dim_n, model, k_min, k_max, eps_min, eps_max, eps_steps,
+              progress=_no_progress):
     X = _scale(X_raw, scaler)
     X = _dim_reduce(X, dim_method, dim_n)
 
     if model == "DBSCAN":
         eps_vals   = np.linspace(eps_min, eps_max, eps_steps)
         silhouettes, n_clusters = [], []
-        for eps in eps_vals:
+        for i, eps in enumerate(eps_vals):
+            progress(i, len(eps_vals), f"eps = {eps:.3g}")
             labels  = DBSCAN(eps=eps, min_samples=5).fit_predict(X)
             s       = _score(X, labels)
             silhouettes.append(s["silhouette"])
@@ -278,7 +294,8 @@ def _run_tune(X_raw, scaler, dim_method, dim_n, model, k_min, k_max, eps_min, ep
                 "silhouettes": silhouettes, "n_clusters": n_clusters}
 
     ks, inertias, silhouettes, calinskis, davies = [], [], [], [], []
-    for k in range(k_min, k_max + 1):
+    for step, k in enumerate(range(k_min, k_max + 1)):
+        progress(step, k_max - k_min + 1, f"k = {k}")
         labels = _fit_model(model, X, k=k)
         s = _score(X, labels)
         ks.append(k)
@@ -304,9 +321,11 @@ def _run_tune(X_raw, scaler, dim_method, dim_n, model, k_min, k_max, eps_min, ep
 
 
 def _run_cluster(X_raw, index, diams, scaler, dim_method, dim_n, model, k,
-                 eps, min_samples, mode, df_hourly):
+                 eps, min_samples, mode, df_hourly, progress=_no_progress):
+    progress(0, 2, "Scaling and reducing…")
     X = _scale(X_raw, scaler)
     X = _dim_reduce(X, dim_method, dim_n)
+    progress(1, 2, f"Fitting {model}…")
     labels = _fit_model(model, X, k=k, eps=eps, min_samples=min_samples)
     
     return {
@@ -513,6 +532,13 @@ class ClusterPanel(QWidget):
         r4.addStretch()
 
         outer.addLayout(r4)
+
+
+        # Red outline while a box holds something unusable.
+        validate_number(self._k_edit, minimum=2, integer=True)
+        validate_number(self._eps_edit, minimum=0)
+        validate_number(self._pca_edit, minimum=1, integer=True)
+
         return box
 
     def _on_model_changed(self, text: str):
@@ -527,13 +553,11 @@ class ClusterPanel(QWidget):
         w = QWidget()
         row = QHBoxLayout(w)
         row.setContentsMargins(0, 0, 0, 0)
-        self._progress_bar = QProgressBar()
-        self._progress_bar.setRange(0, 0)   
-        self._progress_bar.setVisible(False)
-        self._progress_bar.setFixedHeight(6)
+        self._run_progress = RunProgress()
+        self._run_progress.cancel_requested.connect(self._cancel_worker)
         self._status_lbl = QLabel("")
         self._status_lbl.setStyleSheet("font-size: 11px; color: #555;")
-        row.addWidget(self._progress_bar, stretch=1)
+        row.addWidget(self._run_progress, stretch=1)
         row.addWidget(self._status_lbl)
         return w
 
@@ -632,6 +656,11 @@ class ClusterPanel(QWidget):
         self._fig_tune = Figure(figsize=(10, 4))
         self._canvas_tune = FigureCanvasQTAgg(self._fig_tune)
         layout.addWidget(self._canvas_tune, stretch=1)
+
+        # Red outline while a box holds something unusable.
+        validate_number(self._k_min, minimum=2, integer=True)
+        validate_number(self._k_max, minimum=2, integer=True)
+
         return w
 
     def _build_results_tab(self) -> QWidget:
@@ -670,6 +699,14 @@ class ClusterPanel(QWidget):
         self._diams = np.array(data_file.diameters)
         self._set_status(f"Data loaded: {len(self._df):,} rows × {len(self._diams)} bins.")
 
+    def _prepare_X_or_warn(self):
+        """_prepare_X, with its refusals shown to the user instead of raised."""
+        try:
+            return self._prepare_X()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Cannot cluster this data", str(exc))
+            return None, None
+
     def _prepare_X(self) -> tuple[np.ndarray, pd.Index]:
         if self._df is None:
             raise ValueError("No data loaded.")
@@ -682,13 +719,25 @@ class ClusterPanel(QWidget):
         df.index = pd.to_datetime(df.index)
         df = df.fillna(0)
 
-        rows, dates = [], []
+        rows, dates, skipped = [], [], 0
         for date, day_df in df.groupby(df.index.date):
             hourly = day_df.groupby(day_df.index.hour).mean()
-            # FIX: Ensure 24 hour grid and smoothly interpolate missing hours
+
+            # A day with only a few hours measured would otherwise be padded out
+            # to a full diurnal vector and clustered as if it were complete.
+            if len(hourly) < MIN_HOURS_PER_DAY:
+                skipped += 1
+                continue
+
             hourly = hourly.reindex(range(24)).interpolate(limit_direction='both').fillna(0)
             rows.append(hourly.values.flatten())
             dates.append(pd.Timestamp(date))
+
+        if not rows:
+            raise ValueError(f"No day has at least {MIN_HOURS_PER_DAY} hours of data to cluster.")
+        if skipped:
+            self._set_status(f"Clustering {len(rows)} days; skipped {skipped} with "
+                             f"fewer than {MIN_HOURS_PER_DAY} hours of data.")
 
         X = np.array(rows, dtype=float)
         index = pd.DatetimeIndex(dates)
@@ -713,7 +762,8 @@ class ClusterPanel(QWidget):
             QMessageBox.warning(self, "No Data", "Please load data first.")
             return
             
-        X_raw, _ = self._prepare_X()
+        X_raw, _ = self._prepare_X_or_warn()
+        if X_raw is None: return
         dim_method = self._dim_combo.currentText()
         n_dims = self._int("_pca_edit", 3)
         k_clusters = self._int("_k_edit", 4)
@@ -745,7 +795,7 @@ class ClusterPanel(QWidget):
         
         fig.tight_layout()
         layout.addWidget(canvas)
-        dlg.resize(1200, 600)
+        fit_to_screen(dlg, 1200, 600)
         
         self._set_status("Ready.")
         dlg.exec()
@@ -753,7 +803,8 @@ class ClusterPanel(QWidget):
     def _auto_find_dim(self):
         """Sweeps PCA dims from 2 to 10 to find best Silhouette score."""
         if self._df is None: return self._set_status("Load data first.")
-        X_raw, _ = self._prepare_X()
+        X_raw, _ = self._prepare_X_or_warn()
+        if X_raw is None: return
         scaler_method = self._scaler_combo.currentText()
         X_scaled = _scale(X_raw, scaler_method)
         
@@ -781,7 +832,8 @@ class ClusterPanel(QWidget):
             QMessageBox.warning(self, "No Data", "Please load data first.")
             return
             
-        X_raw, _ = self._prepare_X()
+        X_raw, _ = self._prepare_X_or_warn()
+        if X_raw is None: return
         scaler_method = self._scaler_combo.currentText()
         X_scaled = _scale(X_raw, scaler_method)
         k_clusters = self._int("_k_edit", 4)
@@ -821,7 +873,7 @@ class ClusterPanel(QWidget):
         
         fig.tight_layout()
         layout.addWidget(canvas)
-        dlg.resize(1400, 700)
+        fit_to_screen(dlg, 1400, 700)
         
         info = QLabel("<b>Goal:</b> Find the sweet spot where clusters are highly physically distinct. If lines overlap heavily, the clustering failed to find separate physical states.")
         info.setWordWrap(True)
@@ -835,7 +887,8 @@ class ClusterPanel(QWidget):
         models = [n for n, cb in self._model_checks.items() if cb.isChecked()]
         if not models: return self._set_status("Select at least one model.")
 
-        X, _ = self._prepare_X()
+        X, _ = self._prepare_X_or_warn()
+        if X is None: return
         if self._subset_check.isChecked():                                   
             n_samples = self._int("_subset_size", 1000)                      
             if n_samples < len(X):                                           
@@ -854,7 +907,8 @@ class ClusterPanel(QWidget):
 
     def _start_tune(self):
         if self._df is None: return self._set_status("Load data first.")
-        X, _ = self._prepare_X()
+        X, _ = self._prepare_X_or_warn()
+        if X is None: return
         self._launch_worker("tune", dict(
             X_raw=X,
             scaler=self._scaler_combo.currentText(),
@@ -870,7 +924,8 @@ class ClusterPanel(QWidget):
 
     def _start_cluster(self):
         if self._df is None: return self._set_status("Load data first.")
-        X, index = self._prepare_X()
+        X, index = self._prepare_X_or_warn()
+        if X is None: return
         self._launch_worker("cluster", dict(
             X_raw=X, index=index, diams=self._diams,
             scaler=self._scaler_combo.currentText(),
@@ -885,15 +940,30 @@ class ClusterPanel(QWidget):
         ))
 
     def _launch_worker(self, task: str, kwargs: dict):
-        self._progress_bar.setVisible(True)
+        if self._worker is not None and self._worker.isRunning():
+            QMessageBox.information(self, "Already running",
+                                    "Wait for the current run to finish, or cancel it first.")
+            return
+
         self._set_status(f"Running {task}…")
         self._worker = ClusterWorker(task, kwargs)
+        self._worker.progress.connect(self._run_progress.update)
         self._worker.finished.connect(self._on_worker_done)
         self._worker.error.connect(self._on_worker_error)
+        self._worker.cancelled.connect(self._on_worker_cancelled)
+        self._run_progress.start(f"Running {task}…")
         self._worker.start()
 
+    def _cancel_worker(self):
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.cancel()
+
+    def _on_worker_cancelled(self):
+        self._run_progress.stop()
+        self._set_status("Stopped. Nothing was changed.")
+
     def _on_worker_done(self, result: dict):
-        self._progress_bar.setVisible(False)
+        self._run_progress.stop()
         t = result.get("type")
 
         if t == "compare":
@@ -912,7 +982,7 @@ class ClusterPanel(QWidget):
         self._set_status("Done.")
 
     def _on_worker_error(self, msg: str):
-        self._progress_bar.setVisible(False)
+        self._run_progress.stop()
         if "PyTorch is required" in msg:
             QMessageBox.critical(self, "Dependency Error", msg)
         self._set_status(f"Error: {msg}")
@@ -1019,8 +1089,7 @@ class ClusterPanel(QWidget):
         if len(valid_clusters) > 5:
             self.results_warning.setText(f"Warning: Model generated {len(valid_clusters)} clusters! Showing full plots for the top 5 largest. Minor clusters omitted for UI stability.")
         
-        log_d = np.log10(diams)                                              
-        dlogdp = np.mean(np.diff(log_d)) if len(log_d) > 1 else 0.1          
+        dlogdp = dlogdp_per_bin(diams)
 
         # Data collection for summary plots
         sum_diurnals = {}
@@ -1081,7 +1150,8 @@ class ClusterPanel(QWidget):
                 pnsd_diurnal = mean_row.reshape(24, len(diams))              
                 diurnal_idx = np.arange(24)                                  
                 
-                ts_n_vals = (X_subset.sum(axis=1) * dlogdp) / 24             
+                # Daily rows are 24 hours of bins laid end to end.
+                ts_n_vals = integrate_pnsd(X_subset, np.tile(dlogdp, 24)) / 24
                 ts_n = pd.Series(ts_n_vals, index=cl_index)                  
             else:
                 cl_hourly = df_hourly.loc[df_hourly.index.isin(cl_index)]    
@@ -1090,10 +1160,10 @@ class ClusterPanel(QWidget):
                 diurnal_mean = diurnal_mean.reindex(range(24)).interpolate(limit_direction='both').fillna(1e-4)
                 pnsd_diurnal = diurnal_mean.values                           
                 diurnal_idx = np.arange(24)                             
-                ts_n = cl_hourly.sum(axis=1) * dlogdp                        
+                ts_n = (cl_hourly * dlogdp).sum(axis=1)
 
             # Store for summary
-            total_n_diurnal = pnsd_diurnal.sum(axis=1) * dlogdp
+            total_n_diurnal = integrate_pnsd(pnsd_diurnal, dlogdp)
             moy_counts = pd.Series(cl_index).dt.month.value_counts().reindex(range(1, 13), fill_value=0)
             
             sum_diurnals[cl] = (diurnal_idx, total_n_diurnal)
@@ -1304,7 +1374,7 @@ class ClusterPanel(QWidget):
         out = pd.DataFrame({col_name: export_labels}, index=index)
         out.index.name = "datetime"
 
-        path, _ = QFileDialog.getSaveFileName(self, "Save cluster assignments", "", "CSV files (*.csv)")
+        path, _ = get_save_file_name(self, "Save cluster assignments", "", "CSV files (*.csv)")
         if not path: return
         if not path.endswith(".csv"): path += ".csv"
 

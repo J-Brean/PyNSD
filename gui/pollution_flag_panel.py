@@ -9,22 +9,24 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 
 from PyQt6.QtCore import QDate
-from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QComboBox,
-    QFileDialog, QGroupBox, QMessageBox, QDialog, QDateEdit
-)
+from PyQt6.QtWidgets import (QWidget,
+                             QVBoxLayout,
+                             QHBoxLayout,
+                             QLabel,
+                             QPushButton,
+                             QLineEdit,
+                             QComboBox,
+                             QGroupBox,
+                             QMessageBox,
+                             QDialog,
+                             QDateEdit)
 
-from utils.data_loader import DATE_COLUMN_OPTIONS, DATE_FORMAT_OPTIONS, fmt_to_strptime
+from utils.data_loader import DATE_COLUMN_OPTIONS, DATE_FORMAT_OPTIONS, parse_datetime_series
+from utils.helpers import fit_to_screen
+from utils.calculations import dlogdp_per_bin, integrate_pnsd
+from gui.widgets import validate_number
+from gui.filedialogs import get_open_file_name, get_save_file_name
 
-
-def _strip_time_tokens(token_fmt: str) -> str:
-    if not token_fmt:
-        return token_fmt
-    fmt = token_fmt.strip()
-    for suffix in (" HH:mm:ss", " HH:mm", "THH:mm:ss", "THH:mm"):
-        if fmt.endswith(suffix):
-            return fmt[: -len(suffix)].strip()
-    return fmt
 
 
 class ExportDialog(QDialog):
@@ -59,7 +61,7 @@ class ExportDialog(QDialog):
 
         w = int(fig.get_figwidth() * fig.dpi)
         h = int(fig.get_figheight() * fig.dpi) + 50
-        self.resize(w, h)
+        fit_to_screen(self, w, h)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -69,12 +71,12 @@ class ExportDialog(QDialog):
     def apply_size(self):
         try:
             w, h = int(self.val_w.text()), int(self.val_h.text())
-            self.resize(w, h + 50)
+            fit_to_screen(self, w, h + 50)
         except ValueError:
             pass
 
     def save_plot(self):
-        path, _ = QFileDialog.getSaveFileName(
+        path, _ = get_save_file_name(
             self,
             "Save Plot",
             "",
@@ -151,11 +153,7 @@ class PollutionFlagPanel(QWidget):
 
         row_b.addWidget(QLabel("Format:"))
         self.fmt_combo = QComboBox()
-        sorted_fmts = sorted(
-            DATE_FORMAT_OPTIONS,
-            key=lambda x: 0 if str(x[0]).upper().startswith("Y") else (1 if str(x[0]).upper().startswith("D") else 2),
-        )
-        for disp, _ in sorted_fmts:
+        for disp, _ in DATE_FORMAT_OPTIONS:
             self.fmt_combo.addItem(disp)
         self.fmt_combo.currentIndexChanged.connect(self._on_fmt_changed)
         row_b.addWidget(self.fmt_combo)
@@ -269,6 +267,11 @@ class PollutionFlagPanel(QWidget):
         self.canvas = FigureCanvasQTAgg(self.fig)
         root.addWidget(self.canvas, stretch=1)
 
+        # Red outline while a box holds something unusable.
+        validate_number(self.avg_val, minimum=1, integer=True)
+
+
+
     def _on_date_col_changed(self, text: str):
         self.custom_date_col.setVisible(text == "Custom...")
 
@@ -278,7 +281,7 @@ class PollutionFlagPanel(QWidget):
         self.custom_fmt.setVisible(val == "custom")
 
     def _browse_aux_file(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select Auxiliary File", "", "Data (*.csv *.xlsx *.xls *.txt *.tsv *.dat)")
+        path, _ = get_open_file_name(self, "Select Auxiliary File", "", "Data (*.csv *.xlsx *.xls *.txt *.tsv *.dat)")
         if not path:
             return
 
@@ -344,19 +347,7 @@ class PollutionFlagPanel(QWidget):
         fmt_val = next(v for d, v in DATE_FORMAT_OPTIONS if d == fmt_disp)
         date_fmt = self.custom_fmt.text().strip() if fmt_val == "custom" else fmt_val
 
-        raw_dt = aux[dt_col].astype(str).str.strip()
-        parsed = pd.to_datetime(raw_dt, format=fmt_to_strptime(date_fmt), errors="coerce")
-
-        if parsed.isna().any() and ("HH" in str(date_fmt) or "%H" in fmt_to_strptime(date_fmt)):
-            date_only_fmt = _strip_time_tokens(date_fmt)
-            if date_only_fmt != date_fmt:
-                miss = parsed.isna()
-                parsed.loc[miss] = pd.to_datetime(raw_dt[miss], format=fmt_to_strptime(date_only_fmt), errors="coerce")
-
-        if parsed.isna().mean() > 0.2:
-            parsed = pd.to_datetime(raw_dt, errors="coerce", utc=False)
-
-        aux[dt_col] = parsed
+        aux[dt_col] = parse_datetime_series(aux[dt_col], date_fmt)
         aux = aux.dropna(subset=[dt_col]).copy()
 
         tz = self.tz_input.text().strip() or "UTC"
@@ -389,6 +380,16 @@ class PollutionFlagPanel(QWidget):
                 return
             selected_cols.append(pol2)
 
+        # Selecting a repeated column name returns more columns than were asked
+        # for, and renaming them then fails with no message at all.
+        repeated = [c for c in selected_cols if list(aux.columns).count(c) > 1]
+        if repeated:
+            QMessageBox.warning(
+                self, "Repeated column name",
+                f"The auxiliary file has more than one column called '{repeated[0]}'. "
+                "Rename them so each is unique, then load the file again.")
+            return
+
         if selected_cols:
             aux = aux[selected_cols].copy()
             rename_map = {}
@@ -398,10 +399,17 @@ class PollutionFlagPanel(QWidget):
                 rename_map[pol2] = "POLLUTANT_2"
             aux = aux.rename(columns=rename_map)
 
-            if "POLLUTANT_1" in aux.columns:
-                aux["POLLUTANT_1"] = pd.to_numeric(aux["POLLUTANT_1"], errors="coerce")
-            if "POLLUTANT_2" in aux.columns:
-                aux["POLLUTANT_2"] = pd.to_numeric(aux["POLLUTANT_2"], errors="coerce")
+            for slot, chosen in (("POLLUTANT_1", pol1), ("POLLUTANT_2", pol2)):
+                if slot not in aux.columns:
+                    continue
+                aux[slot] = pd.to_numeric(aux[slot], errors="coerce")
+                if aux[slot].isna().all():
+                    QMessageBox.warning(
+                        self, "Pollutant has no numbers",
+                        f"Column '{chosen}' holds no numeric values, so nothing could be "
+                        "flagged from it. Check you picked the right column, and that the "
+                        "file does not use a comma as its decimal separator.")
+                    return
         else:
             # No pollutant columns requested; keep only datetime index for alignment.
             aux = pd.DataFrame(index=aux.index)
@@ -421,6 +429,13 @@ class PollutionFlagPanel(QWidget):
 
     def _join_aux_with_pnsd(self):
         if self.df is None:
+            return
+        # merge_asof compares the two time columns directly, and on empty frames
+        # their dtypes need not match, which fails with an unreadable message.
+        if self.aux_df is not None and (self.aux_df.empty or self.df.empty):
+            QMessageBox.warning(self, "Nothing to join",
+                                "One of the two datasets is empty after parsing. Check the "
+                                "auxiliary file's date column, format and timezone.")
             return
         # If aux_df is None, just use PNSD data as-is for flagging.
         if self.aux_df is None:
@@ -520,9 +535,8 @@ class PollutionFlagPanel(QWidget):
         z = np.clip(z, 1e-6, None)
         # No masking — flagged rows are rendered dimmed via axvspan overlays instead.
 
-        log_d = np.log10(dvals)
-        dlogdp = np.mean(np.diff(log_d)) if len(log_d) > 1 else 1.0
-        total_n = day_df[self._diam_cols].to_numpy(dtype=float).sum(axis=1) * dlogdp
+        dlogdp = dlogdp_per_bin(dvals)
+        total_n = integrate_pnsd(day_df[self._diam_cols].to_numpy(dtype=float), dlogdp)
 
         all_mean = self.joined_df[self._diam_cols].mean(axis=0).to_numpy(dtype=float)
         keep_mask = ~self._flag_mask
@@ -555,7 +569,7 @@ class PollutionFlagPanel(QWidget):
             cmap_name = self.cmap_combo.currentText()
         except AttributeError:
             cmap_name = "turbo"
-        cmap = plt.cm.get_cmap(cmap_name).copy()
+        cmap = plt.get_cmap(cmap_name).copy()
         cmap.set_bad('#bdbdbd')
 
         from matplotlib.colors import LogNorm
@@ -692,7 +706,7 @@ class PollutionFlagPanel(QWidget):
             return
 
         mode = self.export_mode_combo.currentText()
-        path, _ = QFileDialog.getSaveFileName(self, "Export CSV", "", "CSV (*.csv)")
+        path, _ = get_save_file_name(self, "Export CSV", "", "CSV (*.csv)")
         if not path:
             return
 

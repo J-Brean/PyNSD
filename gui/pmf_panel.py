@@ -1,29 +1,44 @@
 import os                                                                # For path manipulation
 import shutil                                                            # For copying the key file
 import subprocess                                                        # For running external .exe
-import copy                                                              # For copying colormaps
 import re                                                                # For parsing the Fortran LOG files
 import json                                                              # For reading/writing archive metadata
 import pandas as pd                                                      # For data handling
 import numpy as np                                                       # For maths operations
 import matplotlib.pyplot as plt                                          # Global Matplotlib import
 import matplotlib as mpl                                                 # Global Matplotlib settings
-import seaborn as sns                                                    # Global Seaborn import
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg         # Embedded plotting for Qt
 from matplotlib.figure import Figure                                     # Figure object 
-from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, 
-                             QPushButton, QFileDialog, QLabel, 
-                             QLineEdit, QComboBox, QDoubleSpinBox, 
-                             QSlider, QGroupBox, QGridLayout, 
-                             QMessageBox, QTableWidget, QSpinBox, 
-                             QTableWidgetItem, QDialog, QProgressBar, 
-                             QApplication, QCheckBox, QTabWidget,
-                             QInputDialog, QListWidget)
+from PyQt6.QtWidgets import (QWidget,
+                             QVBoxLayout,
+                             QHBoxLayout,
+                             QPushButton,
+                             QLabel,
+                             QLineEdit,
+                             QComboBox,
+                             QDoubleSpinBox,
+                             QSlider,
+                             QGroupBox,
+                             QGridLayout,
+                             QMessageBox,
+                             QTableWidget,
+                             QSpinBox,
+                             QTableWidgetItem,
+                             QDialog,
+                             QProgressBar,
+                             QApplication,
+                             QCheckBox,
+                             QTabWidget,
+                             QInputDialog,
+                             QListWidget)
 from PyQt6.QtGui import QFont                                            # For monospace fonts
 from PyQt6.QtCore import Qt, QSettings  # Added QSettings back to the import list
+from utils.calculations import dlogdp_per_bin
 from utils.pmf_ini_generator import generate_pmf_ini                     # External INI generator
 from utils.data_loader import DATE_COLUMN_OPTIONS, DATE_FORMAT_OPTIONS   # Shared datetime parse options
 from utils.tracer_join import build_tracer_frame, align_to_index         # External tracer helpers
+from utils.helpers import fit_to_screen
+from gui.filedialogs import get_existing_directory, get_open_file_name, get_save_file_name
 
 class CowProgressDialog(QDialog):
     def __init__(self, total_steps, parent=None):
@@ -104,7 +119,7 @@ class BootstrapResultsDialog(QDialog):
     def __init__(self, diams, base_F, F_boot, contrib_boot, names, success_rate, n_used, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Bootstrap Results ({n_used} runs, mapping success {success_rate * 100:.0f}%)")
-        self.resize(1100, 760)
+        fit_to_screen(self, 1100, 760)
         self.diams = np.asarray(diams, dtype=float)
         self.base_F = base_F; self.F_boot = F_boot; self.contrib = contrib_boot; self.names = names
         lay = QVBoxLayout(self)
@@ -143,7 +158,7 @@ class BootstrapResultsDialog(QDialog):
         self.fig.tight_layout(); self.canvas.draw()
 
     def _save(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Save Figure", "Bootstrap_Uncertainty.png",
+        path, _ = get_save_file_name(self, "Save Figure", "Bootstrap_Uncertainty.png",
                                               "PNG (*.png);;PDF (*.pdf)")
         if path:
             self.fig.savefig(path, dpi=300, bbox_inches='tight')
@@ -202,7 +217,7 @@ class TracerLoadDialog(QDialog):
         self.custom_fmt.setVisible(val == "custom")
 
     def _browse(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select Tracer File", "",
+        path, _ = get_open_file_name(self, "Select Tracer File", "",
                                               "Data (*.csv *.xlsx *.xls *.txt *.tsv *.dat)")
         if not path:
             return
@@ -323,7 +338,7 @@ class TabbedVisualizer(QDialog):
     def __init__(self, panel, parent=None):
         super().__init__(parent)
         self.panel = panel
-        self.resize(1400, 850)
+        fit_to_screen(self, 1400, 850)
         self._building = False                                           # Re-entrancy guard for slider-driven rebuilds
         self._pending = None                                            # Latest slider request deferred during a build
 
@@ -452,7 +467,7 @@ class TabbedVisualizer(QDialog):
         layout.addWidget(btn_save)                                       
         
     def _save_figure(self, fig, default_name):
-        path, _ = QFileDialog.getSaveFileName(self, "Save Figure", default_name, "PNG (*.png);;PDF (*.pdf);;SVG (*.svg)") 
+        path, _ = get_save_file_name(self, "Save Figure", default_name, "PNG (*.png);;PDF (*.pdf);;SVG (*.svg)") 
         if path: fig.savefig(path, dpi=300, bbox_inches='tight')         
 
     def _get_mean_se_pnsd(self, factor_idx):
@@ -550,7 +565,7 @@ class TabbedVisualizer(QDialog):
         ax = fig.add_subplot(111)
 
         diams = self.panel.diams
-        dlogdp = np.log10(diams[1] / diams[0]) if len(diams) > 1 else 1.0
+        dlogdp = dlogdp_per_bin(diams)
 
         for i in range(self.panel.current_factors):
             name = self.panel._get_factor_name(i)
@@ -558,7 +573,7 @@ class TabbedVisualizer(QDialog):
                 if self.panel.chk_wide_pmf.isChecked():
                     n_bins = len(diams); n_hours = len(self.panel.f_matrix) // n_bins
                     f_reshaped = self.panel.f_matrix.iloc[:, i].values.reshape(n_hours, n_bins)
-                    y_vals = (np.sum(f_reshaped, axis=1) * dlogdp) * self.panel.g_matrix.iloc[:, i].mean()
+                    y_vals = (np.sum(f_reshaped * dlogdp, axis=1)) * self.panel.g_matrix.iloc[:, i].mean()
                     ax.plot(np.arange(n_hours), y_vals, label=name, lw=2, marker='o')
                 else:
                     df = self.g_number.iloc[:, i].copy()
@@ -692,7 +707,7 @@ class TabbedVisualizer(QDialog):
     def _build_summary_tab(self):
         tab = QWidget(); layout = QVBoxLayout(tab)
         diams = self.panel.diams
-        dlogdp = np.log10(diams[1] / diams[0]) if len(diams) > 1 else 1.0
+        dlogdp = dlogdp_per_bin(diams)
         mass_factor = (np.pi / 6) * (diams ** 3) * 1e-9
 
         # Real mean dN/dlogDp contributed by each factor = mean(raw G) * F profile.
@@ -701,7 +716,7 @@ class TabbedVisualizer(QDialog):
             f_mean, _ = self._get_mean_se_pnsd(i)
             real = f_mean * self.panel.g_matrix.iloc[:, i].mean()
             profiles.append(real)
-            number_concs.append(float(np.sum(real) * dlogdp))
+            number_concs.append(float(np.sum(real * dlogdp)))
         total_n = np.sum(number_concs)
 
         rows = []
@@ -712,7 +727,7 @@ class TabbedVisualizer(QDialog):
             pct = 100.0 * n_conc / total_n if total_n else np.nan
             modal = diams[int(np.argmax(real))] if len(real) else np.nan
             gmd = np.exp(np.sum(w * np.log(diams)) / np.sum(w)) if np.sum(w) > 0 else np.nan
-            mass = float(np.sum(real * mass_factor) * dlogdp)
+            mass = float(np.sum(real * mass_factor * dlogdp))
             rows.append([self.panel._get_factor_name(i), n_conc, pct, modal, gmd, mass])
 
         headers = ["Factor", "Mean N (cm⁻³)", "% of N", "Modal Dp (nm)", "GMD (nm)", "Mass (µg m⁻³)"]
@@ -733,7 +748,7 @@ class TabbedVisualizer(QDialog):
         self.tabs.addTab(tab, "Factor Summary")
 
     def _export_summary(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Save Factor Summary", "Factor_Summary.csv", "CSV (*.csv)")
+        path, _ = get_save_file_name(self, "Save Factor Summary", "Factor_Summary.csv", "CSV (*.csv)")
         if path:
             self.summary_df.to_csv(path, index_label="Factor")
 
@@ -1083,7 +1098,7 @@ class TabbedVisualizer(QDialog):
     def _export_nucsplit(self):
         if getattr(self, '_nucsplit_df', None) is None:
             return
-        path, _ = QFileDialog.getSaveFileName(self, "Save Nucleation Sources", "Nucleation_Sources.csv", "CSV (*.csv)")
+        path, _ = get_save_file_name(self, "Save Nucleation Sources", "Nucleation_Sources.csv", "CSV (*.csv)")
         if path:
             self._nucsplit_df.to_csv(path, index_label="datetime")
 
@@ -1263,16 +1278,16 @@ class PMFPanel(QWidget):
     def get_scaled_g(self):                                              
         g_num = self.g_matrix.copy()
         diams = self.diams
-        dlogdp = np.log10(diams[1] / diams[0]) if len(diams) > 1 else 1.0
+        dlogdp = dlogdp_per_bin(diams)
         f_sums = []
         for i in range(self.current_factors):
             if self.chk_wide_pmf.isChecked():
                 n_bins = len(diams)
                 n_hours = len(self.f_matrix) // n_bins
                 f_reshaped = self.f_matrix.iloc[:, i].values.reshape(n_hours, n_bins)
-                f_sums.append((f_reshaped.sum(axis=1) * dlogdp).mean())
+                f_sums.append((f_reshaped * dlogdp).sum(axis=1).mean())
             else:
-                f_sums.append(self.f_matrix.iloc[:, i].sum() * dlogdp)
+                f_sums.append(float(np.sum(self.f_matrix.iloc[:, i].to_numpy() * dlogdp)))
         for i in range(self.current_factors):
             g_num.iloc[:, i] = g_num.iloc[:, i] * f_sums[i]
         return g_num
@@ -1433,7 +1448,7 @@ class PMFPanel(QWidget):
         sel_layout.addWidget(self.lbl_fpeak); sel_layout.addWidget(self.combo_fpeak)
         explore_layout.addLayout(sel_layout)                             
         
-        action_layout = QHBoxLayout()                                            # Container
+        action_layout = QGridLayout()                                            # Wraps to a second row on narrow screens
         btn_vis = QPushButton("1. Open Visualisation Suite")                     # Button 1
         btn_vis.clicked.connect(self.open_visualiser)                            # Link
         btn_opt = QPushButton("2. Optimise Error Fraction")                     # Button 2
@@ -1458,14 +1473,10 @@ class PMFPanel(QWidget):
         btn_load_lib.setStyleSheet("background-color: #795548; color: white;")   # Brown style
         btn_load_lib.clicked.connect(self.load_from_library)                     # Link logic
         
-        for b in [btn_vis, btn_opt, btn_rename, btn_combine, btn_boot, btn_archive, btn_load_lib]:
-            action_layout.addWidget(b)                                           # Add all to layout
-        action_layout.addWidget(btn_vis)                                                 # Existing
-        action_layout.addWidget(btn_opt)                                                 # Existing
-        action_layout.addWidget(btn_rename)                                              # Existing
-        action_layout.addWidget(btn_archive)                                             # Existing
-        action_layout.addWidget(btn_load_lib)                                            # Add new button
-        
+        buttons = [btn_vis, btn_opt, btn_rename, btn_combine, btn_boot, btn_archive, btn_load_lib]
+        for i, b in enumerate(buttons):
+            action_layout.addWidget(b, i // 4, i % 4)                             # Four per row, not one long strip
+
         explore_layout.addLayout(action_layout)                                          # Pack layout
 
         tracer_row = QHBoxLayout()                                                        # External tracer loader
@@ -1492,7 +1503,7 @@ class PMFPanel(QWidget):
             QMessageBox.warning(self, "Error", "No matrices available to export.") 
             return
 
-        path, _ = QFileDialog.getSaveFileName(self, "Save Export Data", "PyNSD_Final_Factors.csv", "CSV Files (*.csv)") 
+        path, _ = get_save_file_name(self, "Save Export Data", "PyNSD_Final_Factors.csv", "CSV Files (*.csv)") 
         if not path: return                                              
         base, _ = os.path.splitext(path)                                 
         
@@ -1556,7 +1567,7 @@ class PMFPanel(QWidget):
         QMessageBox.information(self, "WidePMF Mode", msg)               
 
     def select_pmf_exe(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Select pmf2.exe", "", "Executables (*.exe)") 
+        file_path, _ = get_open_file_name(self, "Select pmf2.exe", "", "Executables (*.exe)") 
         if file_path:                                                    
             self.pmf_exe_path = file_path                                
             self.working_dir = os.path.dirname(file_path)                        
@@ -1572,7 +1583,7 @@ class PMFPanel(QWidget):
                 self.lbl_key.setText("Key: pmf2key.key (Auto-found)")    
 
     def select_pmf_key(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Select pmf2key.key", "", "Key Files (*.key);;All Files (*)") 
+        file_path, _ = get_open_file_name(self, "Select pmf2key.key", "", "Key Files (*.key);;All Files (*)") 
         if file_path:                                                    
             self.pmf_key_path = file_path                                
             self.settings.setValue("key_path", file_path)                
@@ -1766,7 +1777,7 @@ class PMFPanel(QWidget):
                 f.write(row + "\r\n")
 
         dialog = BootstrapProgressDialog(n_boot, self); dialog.show()
-        dlogdp = np.log10(self.diams[1] / self.diams[0]) if len(self.diams) > 1 else 1.0
+        dlogdp = dlogdp_per_bin(self.diams)
 
         F_boot = [[] for _ in range(factors)]
         contrib = []
@@ -1798,7 +1809,7 @@ class PMFPanel(QWidget):
             mapping, scores = self._match_factors(base_F, bf)
             for a in range(factors):
                 F_boot[a].append(bf[:, mapping[a]])
-            contrib.append(np.array([bg[:, mapping[a]].mean() * (bf[:, mapping[a]].sum() * dlogdp)
+            contrib.append(np.array([bg[:, mapping[a]].mean() * float(np.sum(bf[:, mapping[a]] * dlogdp))
                                      for a in range(factors)]))
             n_used += 1
             n_scores += factors; n_ok += int(np.sum(np.array(scores) >= thresh))
@@ -2003,7 +2014,7 @@ class PMFPanel(QWidget):
 
     def load_from_library(self):
         library_root = os.path.join(self.working_dir, "saved_library") if self.working_dir else "saved_library"
-        selected_dir = QFileDialog.getExistingDirectory(self, "Select Archived Model", library_root)
+        selected_dir = get_existing_directory(self, "Select Archived Model", library_root)
         if not selected_dir: return
 
         try:

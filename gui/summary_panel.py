@@ -1,17 +1,35 @@
 import numpy as np
 import pandas as pd
 import matplotlib.dates as mdates
-from scipy.signal import find_peaks
 from scipy.optimize import curve_fit
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.colors import LogNorm
-from matplotlib import rcParams, cm
-from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
-                             QLineEdit, QComboBox, QSplitter, QTableWidget, 
-                             QTableWidgetItem, QHeaderView, QPushButton,
-                             QMessageBox, QDialog, QFileDialog, QSizePolicy)
-from PyQt6.QtCore import Qt
+import matplotlib
+from matplotlib import rcParams
+from PyQt6.QtWidgets import (QWidget,
+                             QVBoxLayout,
+                             QHBoxLayout,
+                             QLabel,
+                             QLineEdit,
+                             QComboBox,
+                             QSplitter,
+                             QTableWidget,
+                             QTableWidgetItem,
+                             QHeaderView,
+                             QPushButton,
+                             QMessageBox,
+                             QDialog,
+                             QSizePolicy)
+from PyQt6.QtCore import Qt, QTimer
+from utils.calculations import dlogdp_per_bin, integrate_pnsd, resolve_dlogdp
+from utils.helpers import fit_to_screen
+from gui.widgets import validate_number
+from gui.filedialogs import get_save_file_name
+
+# Mesh columns drawn at once. Comfortably above screen width and a 300 dpi
+# export, but far below the row count of a long high-resolution deployment.
+MAX_MESH_COLUMNS = 4000
 
 # Style settings - Force LaTeX to use the same serif font as the UI
 rcParams['font.family'] = 'serif'
@@ -59,7 +77,7 @@ class ExportDialog(QDialog):
         
         w = int(fig.get_figwidth() * fig.dpi)
         h = int(fig.get_figheight() * fig.dpi) + 50
-        self.resize(w, h)
+        fit_to_screen(self, w, h)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -69,12 +87,12 @@ class ExportDialog(QDialog):
     def apply_size(self):
         try:
             w, h = int(self.val_w.text()), int(self.val_h.text())
-            self.resize(w, h + 50)
+            fit_to_screen(self, w, h + 50)
         except ValueError:
             pass
 
     def save_plot(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Save Plot", "", "PNG Files (*.png);;PDF Files (*.pdf);;SVG Files (*.svg)")
+        path, _ = get_save_file_name(self, "Save Plot", "", "PNG Files (*.png);;PDF Files (*.pdf);;SVG Files (*.svg)")
         if path:
             w_in = self.canvas.width() / self.fig.dpi
             h_in = self.canvas.height() / self.fig.dpi
@@ -133,12 +151,12 @@ class SummaryPanel(QWidget):
         ctrl_layout = QHBoxLayout()
         ctrl_layout.addWidget(QLabel("dlogDp:"))
         self.dlogdp_input = QLineEdit("0.0")
-        self.dlogdp_input.textChanged.connect(lambda: self.update_top())
+        self.dlogdp_input.editingFinished.connect(lambda: self.update_top())
         ctrl_layout.addWidget(self.dlogdp_input)
         
         ctrl_layout.addWidget(QLabel("Density (g/cm³):"))
         self.density_input = QLineEdit("1.5")
-        self.density_input.textChanged.connect(lambda: self.update_bottom())
+        self.density_input.editingFinished.connect(lambda: self.update_bottom())
         ctrl_layout.addWidget(self.density_input)
         
         ctrl_layout.addWidget(QLabel("Colour Map:"))
@@ -237,6 +255,45 @@ class SummaryPanel(QWidget):
         self.zoom_cid = None
         self.line_total_n = None
         self.total_n_series = None
+        self._date_nums = np.array([])
+
+        self._pending_xlim = None
+        self._zoom_timer = QTimer(self)
+        self._zoom_timer.setSingleShot(True)
+        self._zoom_timer.timeout.connect(self._apply_zoom)
+
+        # Red outline while a box holds something unusable.
+        validate_number(self.dlogdp_input, minimum=0, maximum=2)
+        validate_number(self.density_input, minimum=0.1, maximum=25)
+        validate_number(self.cbar_min, minimum=0)
+        validate_number(self.cbar_max, minimum=0)
+
+
+
+
+    def _downsample_for_mesh(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Average the time axis down to what a screen can actually resolve.
+
+        A year of 5 min data is 105 000 mesh columns behind a plot about 1200 px
+        wide, and matplotlib rasterises every one of them.  The cap is well above
+        both screen and 300 dpi export resolution, so the picture is unchanged.
+        Zooming re-draws from the full data, so detail is not lost.
+        """
+        if len(df) <= MAX_MESH_COLUMNS:
+            return df
+
+        step = int(np.ceil(len(df) / MAX_MESH_COLUMNS))
+        blocks = np.arange(len(df)) // step
+        out = df.groupby(blocks).mean()                    # all-NaN blocks stay NaN, so gaps survive
+        out.index = df.index[::step][:len(out)]
+        return out
+
+    def _dlogdp_enabled(self) -> bool:
+        """A zero or unreadable dlogDp box means 'do not draw total number'."""
+        try:
+            return float(self.dlogdp_input.text()) > 0
+        except ValueError:
+            return False
 
     def _insert_time_gaps_for_plot(self, df: pd.DataFrame) -> pd.DataFrame:
         """Reindex to expected cadence so missing periods become NaN gaps in plots."""
@@ -261,19 +318,18 @@ class SummaryPanel(QWidget):
         temp_df.index = pd.to_datetime(temp_df.index, errors='coerce')
         self.df = temp_df[temp_df.index.notna()]
         self.diams = np.array(data_file.diameters)
+        self._date_nums = mdates.date2num(self.df.index)     # reused by every zoom event
         
-        log_diams = np.log10(self.diams)
-        avg_dlogdp = np.mean(np.diff(log_diams)) if len(log_diams) > 1 else 0.1
-        self.dlogdp_input.setText(f"{avg_dlogdp:.4f}")
+        # Shown for information: leaving it alone means the real per-bin widths
+        # are used, typing a different number forces that uniform width instead.
+        self.dlogdp_input.setText(f"{float(np.mean(dlogdp_per_bin(self.diams))):.4f}")
         
         self.update_top()
         self.update_bottom()
 
     def update_top(self):
         if self.df is None or self.df.empty: return
-        try: dlogdp = float(self.dlogdp_input.text())
-        except ValueError: dlogdp = 0.0
-        
+
         if self.cbar: self.cbar.remove()
         self.cbar = None
         if self.zoom_cid: self.ax_contour.callbacks.disconnect(self.zoom_cid)
@@ -284,18 +340,17 @@ class SummaryPanel(QWidget):
         self.ax_line.clear()
         self.line_total_n = None
 
-        plot_df = self._insert_time_gaps_for_plot(self.df)
+        plot_df = self._downsample_for_mesh(self._insert_time_gaps_for_plot(self.df))
         pnsd = plot_df.to_numpy(dtype=float)
         pnsd_safe = np.where(np.isnan(pnsd), np.nan, np.clip(pnsd, 1e-4, None))
-        finite_vals = pnsd_safe[np.isfinite(pnsd_safe)]
-        if finite_vals.size == 0:
+        if not np.any(np.isfinite(pnsd_safe)):
             return
-        
+
         v_min = float(self.cbar_min.text()) if self.cbar_min.text() else 1.0
-        v_max = float(self.cbar_max.text()) if self.cbar_max.text() else np.nanmax(finite_vals)
+        v_max = float(self.cbar_max.text()) if self.cbar_max.text() else float(np.nanmax(pnsd_safe))
         if v_max <= v_min: v_max = v_min * 10
 
-        cmap = cm.get_cmap(self.cmap_combo.currentText()).copy()
+        cmap = matplotlib.colormaps[self.cmap_combo.currentText()].copy()
         cmap.set_bad(color='white')
         
         mesh = self.ax_contour.pcolormesh(plot_df.index, self.diams, pnsd_safe.T, 
@@ -327,8 +382,8 @@ class SummaryPanel(QWidget):
         self.ax_contour.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
         self.ax_contour.set_ylabel("Diameter (nm)")
 
-        if dlogdp > 0:
-            total_n = np.nansum(pnsd, axis=1) * dlogdp
+        if self._dlogdp_enabled():
+            total_n = integrate_pnsd(pnsd, resolve_dlogdp(self.diams, self.dlogdp_input.text()))
         else:
             total_n = np.zeros(len(pnsd))
         all_missing_rows = np.all(np.isnan(pnsd), axis=1)
@@ -372,32 +427,44 @@ class SummaryPanel(QWidget):
         self.canvas_top.draw_idle()
 
     def on_zoom(self, ax):
+        """Queue a refresh of the lower plots rather than recomputing per event.
+
+        A single drag or wheel gesture emits many xlim_changed signals, and each
+        one re-fits the lognormal modes; doing that per event is what makes
+        zooming feel stuck on a large dataset.
+        """
         if self.df is None: return
-        xlim = ax.get_xlim()
-        
+        self._pending_xlim = ax.get_xlim()
+        self._zoom_timer.start(120)
+
+    def _apply_zoom(self):
+        if self.df is None or self._pending_xlim is None: return
+        xlim = self._pending_xlim
+
         self._update_top_line(xlim)
-        
-        dates = mdates.date2num(self.df.index)
-        idx_start = np.searchsorted(dates, xlim[0])
-        idx_end = np.searchsorted(dates, xlim[1])
-        self.update_bottom(int(max(0, idx_start)), int(min(len(dates)-1, idx_end)))
+
+        idx_start = np.searchsorted(self._date_nums, xlim[0])
+        idx_end = np.searchsorted(self._date_nums, xlim[1])
+        self.update_bottom(int(max(0, idx_start)), int(min(len(self._date_nums) - 1, idx_end)))
 
     def update_bottom(self, idx_start=None, idx_end=None):                   
         if self.df is None or self.df.empty: return                          
         if isinstance(idx_start, bool): idx_start = None                     
             
-        try: density = float(self.density_input.text())                      
-        except ValueError: density = 1.5                                     
-        try: dlogdp = float(self.dlogdp_input.text())                        
-        except ValueError: dlogdp = 0.0                                      
-        
+        try: density = float(self.density_input.text())
+        except ValueError: density = 1.5
+        dlogdp = resolve_dlogdp(self.diams, self.dlogdp_input.text())        # per-bin widths
+
         if idx_start is None: idx_start, idx_end = 0, len(self.df) - 1       
         subset = self.df.iloc[idx_start:idx_end]                             
         if subset.empty: return                                              
         
-        for ax in [self.ax_dist_num, self.ax_dist_mass, self.ax_diur_num, self.ax_diur_mass]: 
-            ax.set_yscale('linear')                                          
-            ax.clear()                                                       
+        for ax in [self.ax_dist_num, self.ax_dist_mass, self.ax_diur_num, self.ax_diur_mass]:
+            # Back to linear on both axes first: clearing a log axis resets its
+            # limits to (0, 1), which warns and leaves the axis in a bad state.
+            ax.set_yscale('linear')
+            ax.set_xscale('linear')
+            ax.clear()
             
         volume = (np.pi / 6) * (self.diams ** 3)                             
         mass_factor = density * 1e-9                                         
@@ -430,7 +497,25 @@ class SummaryPanel(QWidget):
         x_log10 = np.log10(self.diams)
         y_data = avg_pnsd
         max_y = np.max(y_data)
-        
+
+        # Zooming into a gap gives an all-NaN window, and a single-bin file gives
+        # a degenerate fit range. Either used to stop update_bottom part way with
+        # no message, leaving the lower plots half drawn.
+        fittable = (np.isfinite(y_data).sum() >= 4 and np.isfinite(max_y)
+                    and max_y > 0 and len(np.unique(x_log10)) > 3)
+        if not fittable:
+            # A log axis with nothing positive on it refuses to draw at all, so
+            # put these back to linear before touching the canvas.
+            for ax in (self.ax_dist_num, self.ax_dist_mass, self.ax_diur_num, self.ax_diur_mass):
+                ax.set_xscale('linear')
+                ax.set_yscale('linear')
+            self.table.setRowCount(1)
+            self.table.setVerticalHeaderLabels(["Status"])
+            self.table.setItem(0, 0, QTableWidgetItem("Not enough data in view"))
+            self.canvas_dist.draw()
+            self.canvas_diur.draw()
+            return
+
         # Seed the solver with 3 standard atmospheric modes instead of using find_peaks
         # (Nucleation ~15nm, Aitken ~50nm, Accumulation ~150nm)
         guess_dps = [15.0, 50.0, 150.0]
@@ -474,8 +559,8 @@ class SummaryPanel(QWidget):
             self.ax_dist_num.plot(self.diams, total_fit, color='black', alpha=0.8, ls=':', lw=1.5, label="Total Fit")
 
         # --- Plot 2: Average Diurnal Cycle ---
-        subset_n = subset.sum(axis=1) * dlogdp                               
-        subset_mass = (subset * volume * mass_factor).sum(axis=1) * dlogdp    
+        subset_n = (subset * dlogdp).sum(axis=1)
+        subset_mass = (subset * volume * mass_factor * dlogdp).sum(axis=1)
         
         diurnal_n = subset_n.groupby(subset_n.index.hour).mean().clip(lower=1e-4)             
         diurnal_m = subset_mass.groupby(subset_mass.index.hour).mean().clip(lower=1e-9)       

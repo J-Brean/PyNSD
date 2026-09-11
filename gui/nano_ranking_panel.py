@@ -5,17 +5,29 @@ import pandas as pd                                                          # D
 import scipy.stats as stats                                                  # For KDE fitting
 from scipy.signal import find_peaks                                          # For peak finding
 import matplotlib.dates as mdates                                            # Date formatting
-import matplotlib.cm as cm                                                   # Colormaps
 from matplotlib.figure import Figure                                         # Matplotlib figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg              # Canvas elements
 from matplotlib.colors import LogNorm                                        # Log scaling
 from matplotlib import rcParams                                              # Global plot parameters
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal                             # Core Qt
-from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,      # UI Layouts
-                             QLineEdit, QComboBox, QSplitter, QTabWidget,    # UI Widgets
-                             QPushButton, QProgressBar, QGroupBox, QScrollArea,
-                             QDialog, QMessageBox, QFileDialog)
+from PyQt6.QtWidgets import (QWidget,
+                             QVBoxLayout,
+                             QHBoxLayout,
+                             QLabel,
+                             QLineEdit,
+                             QComboBox,
+                             QTabWidget,
+                             QPushButton,
+                             QProgressBar,
+                             QGroupBox,
+                             QScrollArea,
+                             QDialog,
+                             QMessageBox)
+from utils.helpers import fit_to_screen
+from utils.calculations import dlogdp_per_bin
+from gui.widgets import validate_number
+from gui.filedialogs import get_save_file_name
 
 # ── Matplotlib global style ─────────────────────────────────────────────── #
 rcParams['font.family'] = 'serif'                                            
@@ -63,7 +75,7 @@ class ExportDialog(QDialog):
         
         w = int(fig.get_figwidth() * fig.dpi)
         h = int(fig.get_figheight() * fig.dpi) + 50
-        self.resize(w, h)
+        fit_to_screen(self, w, h)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -73,12 +85,12 @@ class ExportDialog(QDialog):
     def apply_size(self):
         try:
             w, h = int(self.val_w.text()), int(self.val_h.text())
-            self.resize(w, h + 50)
+            fit_to_screen(self, w, h + 50)
         except ValueError:
             pass
 
     def save_plot(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Save Plot", "", "PNG Files (*.png);;PDF Files (*.pdf);;SVG Files (*.svg)")
+        path, _ = get_save_file_name(self, "Save Plot", "", "PNG Files (*.png);;PDF Files (*.pdf);;SVG Files (*.svg)")
         if path:
             w_in = self.canvas.width() / self.fig.dpi
             h_in = self.canvas.height() / self.fig.dpi
@@ -121,10 +133,9 @@ class NanoRankingWorker(QThread):
         mask = (self.diams >= dp_min) & (self.diams <= dp_max)               
         if not mask.any(): raise ValueError("No bins in diameter range")     
         
-        log_d = np.log10(self.diams)                                         
-        dlogdp = np.mean(np.diff(log_d)) if len(log_d) > 1 else 0.1          
+        dlogdp = dlogdp_per_bin(self.diams)
         
-        n_target = self.df.iloc[:, mask].sum(axis=1) * dlogdp                
+        n_target = (self.df.iloc[:, mask] * dlogdp[mask]).sum(axis=1)
         n_smooth = n_target.rolling(f"{smooth_hrs}h", center=True).median()  
         
         daily_stats = []                                                     
@@ -235,7 +246,7 @@ class NanoRankingPanel(QWidget):
 
     def _export_csv(self):
         if self._results is None: return QMessageBox.warning(self, "No Data", "Calculate ranking first!")
-        path, _ = QFileDialog.getSaveFileName(self, "Save Nano Ranking Bins", "", "CSV Files (*.csv)")
+        path, _ = get_save_file_name(self, "Save Nano Ranking Bins", "", "CSV Files (*.csv)")
         if not path: return
         
         res_df = self._results['daily_df']
@@ -322,12 +333,12 @@ class NanoRankingPanel(QWidget):
         
         layout.addWidget(QLabel("Min Colour:"))                              
         self._cbar_min = QLineEdit("1")                                      
-        self._cbar_min.textChanged.connect(self._redraw_visuals)             
+        self._cbar_min.editingFinished.connect(self._redraw_visuals)             
         layout.addWidget(self._cbar_min)                                     
         
         layout.addWidget(QLabel("Max Colour:"))                              
         self._cbar_max = QLineEdit("")                                       
-        self._cbar_max.textChanged.connect(self._redraw_visuals)             
+        self._cbar_max.editingFinished.connect(self._redraw_visuals)             
         layout.addWidget(self._cbar_max)                                     
 
         layout.addStretch()                                                  
@@ -340,6 +351,13 @@ class NanoRankingPanel(QWidget):
         self._export_btn.setEnabled(False)                                  
         layout.addWidget(self._export_btn)                                  
         
+
+
+        # Red outline while a box holds something unusable.
+        validate_number(self._dp_min, minimum=0)
+        validate_number(self._dp_max, minimum=0)
+        validate_number(self._smooth, minimum=0)
+
         return box                                                           
 
     def _build_method_tab(self) -> QWidget:                                  
@@ -622,8 +640,7 @@ class NanoRankingPanel(QWidget):
         try: v_max_user = float(self._cbar_max.text())                       
         except ValueError: v_max_user = None                                 
 
-        log_d = np.log10(self._diams)                                        
-        dlogdp = np.mean(np.diff(log_d)) if len(log_d) > 1 else 0.1          
+        dlogdp = dlogdp_per_bin(self._diams)
         mask_target = (self._diams >= params['dp_min']) & (self._diams <= params['dp_max']) 
         
         self.fig_perc.clear()
@@ -676,8 +693,8 @@ class NanoRankingPanel(QWidget):
             
             # --- Right Hand Axes ---
             if col == 1:
-                total_n = diurnal_mean.sum(axis=1) * dlogdp                      
-                target_n = diurnal_mean.iloc[:, mask_target].sum(axis=1) * dlogdp 
+                total_n = (diurnal_mean * dlogdp).sum(axis=1)
+                target_n = (diurnal_mean.iloc[:, mask_target] * dlogdp[mask_target]).sum(axis=1)
                 fraction = np.where(total_n > 0, target_n / total_n, 0)          
                 
                 ax_num = ax.twinx()                                              

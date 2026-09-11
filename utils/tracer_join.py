@@ -1,34 +1,19 @@
 """Shared helpers for parsing an external time series (gas/met tracers) and
 aligning it onto an existing datetime index such as a PMF G matrix.
 
-The datetime parsing mirrors the logic proven in gui/wind_panel.py, but is kept
-here as standalone functions so multiple panels can reuse it without coupling.
+Datetime parsing is delegated to utils.data_loader.parse_datetime_series so that
+tracer files accept exactly the same date variants as the PNSD loader.
 """
 from __future__ import annotations
 
-import numpy as np
 import pandas as pd
 
-from utils.data_loader import DATE_FORMAT_OPTIONS, fmt_to_strptime, strip_time_tokens
+from utils.data_loader import parse_datetime_series
 
 
 def parse_datetimes(raw_dt: pd.Series, date_fmt: str, tz: str) -> pd.Series:
-    """Parse a raw string datetime column into a tz-aware Series.
-
-    Falls back to a date-only format if times fail to parse, then to a loose
-    parse if a fifth of rows are still NaT, matching the wind panel's behaviour.
-    """
-    raw = raw_dt.astype(str).str.strip()
-    parsed = pd.to_datetime(raw, format=fmt_to_strptime(date_fmt), errors="coerce")
-
-    if parsed.isna().any() and ("HH" in str(date_fmt) or "%H" in fmt_to_strptime(date_fmt)):
-        date_only = strip_time_tokens(date_fmt)
-        if date_only != date_fmt:
-            miss = parsed.isna()
-            parsed.loc[miss] = pd.to_datetime(raw[miss], format=fmt_to_strptime(date_only), errors="coerce")
-
-    if parsed.isna().mean() > 0.2:
-        parsed = pd.to_datetime(raw, errors="coerce", utc=False)
+    """Parse a raw string datetime column into a tz-aware Series."""
+    parsed = parse_datetime_series(raw_dt, date_fmt)
 
     tz = tz or "UTC"
     if parsed.dt.tz is None:

@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import os
-import tempfile
+from pathlib import Path
 import numpy as np
 import pandas as pd
-from scipy import stats, signal
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import copy
@@ -14,15 +13,35 @@ from matplotlib.colors import LogNorm
 from matplotlib.widgets import RectangleSelector
 from matplotlib import rcParams
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-                             QComboBox, QPushButton, QSlider, QDialog,
-                             QMessageBox, QGroupBox, QLineEdit, QFileDialog,
-                             QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView, QSplitter, QInputDialog)
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtWidgets import (QTabWidget, QWidget,
+                             QVBoxLayout,
+                             QHBoxLayout,
+                             QLabel,
+                             QComboBox,
+                             QPushButton,
+                             QSlider,
+                             QDialog,
+                             QMessageBox,
+                             QGroupBox,
+                             QLineEdit,
+                             QCheckBox,
+                             QTableWidget,
+                             QTableWidgetItem,
+                             QHeaderView,
+                             QSplitter,
+                             QInputDialog)
 
 from utils.calculations import (calc_condensation_sink, calc_coagulation_sink, 
+                                dlogdp_per_bin, integrate_pnsd, resolve_dlogdp,
                                 calc_formation_rate, fit_modes_to_pnsd, calc_growth_rate,
                                 calculate_j1_5, calculate_m)
+from utils.helpers import fit_to_screen
+from gui.errors import log_path
+from gui.npf_auto import AutoIdentifierSection
+from gui.widgets import RunProgress, validate_number
+from gui.workers import CancellableWorker
+from gui.filedialogs import get_save_file_name
 
 try:
     from fastai.vision.all import load_learner                                       
@@ -45,7 +64,7 @@ class CoagSWindow(QDialog):
     def __init__(self, day_df, diams, dlogdp, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Coagulation Matrix Analysis")                       
-        self.resize(1200, 600)                                                   
+        fit_to_screen(self, 1200, 600)                                                   
         self.day_df = day_df                                                     
         self.diams = diams                                                       
         self.dlogdp = dlogdp                                                     
@@ -86,10 +105,8 @@ class CoagSWindow(QDialog):
         self.canvas.draw()
 
 
-class MLClassifierWorker(QThread):
-    progress = pyqtSignal(int, str)                                              
-    finished = pyqtSignal(object)                                                
-    error = pyqtSignal(str)                                                      
+class MLClassifierWorker(CancellableWorker):
+    """Classifies each day with the CNN, reporting progress and stoppable."""
 
     def __init__(self, df: pd.DataFrame, diams: np.ndarray, model_path: str, threshold: float, file_name: str = "Dataset"):
         super().__init__()
@@ -99,62 +116,56 @@ class MLClassifierWorker(QThread):
         self.threshold = threshold
         self.file_name = file_name                                               
 
-    def run(self):
-        try:
-            if load_learner is None: raise ImportError("fastai is not installed.")
-                
-            learner = load_learner(self.model_path)                                  
-            results = []
+    def work(self):
+        if load_learner is None: raise ImportError("fastai is not installed.")
             
-            class_map = {'NPF': 'NPF', 'NO': 'non-NPF', 'BAD': 'bad data'}            
+        learner = load_learner(self.model_path)                                  
+        results = []
+        
+        class_map = {'NPF': 'NPF', 'NO': 'non-NPF', 'BAD': 'bad data'}            
+        
+        groups = list(self.df.groupby(self.df.index.date))                        
+        total_days = len(groups)
+        
+        debug_dir = str(log_path().parent / "ML_contour_plots")
+        os.makedirs(debug_dir, exist_ok=True)
+        
+        for f in os.listdir(debug_dir):                                      
+            os.remove(os.path.join(debug_dir, f))                            
+        
+        for idx, (date, day_df) in enumerate(groups):
+            self.tick(idx, total_days, f"Analysing {date}…")                  
             
-            groups = list(self.df.groupby(self.df.index.date))                        
-            total_days = len(groups)
-            
-            debug_dir = os.path.join(os.getcwd(), "ML_contour_plots")
-            os.makedirs(debug_dir, exist_ok=True)
-            
-            for f in os.listdir(debug_dir):                                      
-                os.remove(os.path.join(debug_dir, f))                            
-            
-            for idx, (date, day_df) in enumerate(groups):
-                pct = int((idx / total_days) * 100)
-                self.progress.emit(pct, f"Analysing {date}...")                  
-                
-                if len(day_df) < 12:
-                    results.append({
-                        'date': pd.Timestamp(date), 'raw_class': 'bad data', 
-                        'prob': 1.0, 'prob_NPF': 0.0, 'prob_NonNPF': 0.0, 'prob_Bad': 1.0
-                    })
-                    continue
-                
-                date_str = pd.Timestamp(date).strftime('%Y-%m-%d')                
-                img_name = f"{self.file_name}_{date_str}.png"                    
-                img_path = os.path.join(debug_dir, img_name)                     
-                
-                self._generate_temp_plot(day_df, img_path)                       
-                
-                pred_class, pred_idx, outputs = learner.predict(img_path)        
-                vocab = list(learner.dls.vocab)
-                all_probs = {str(k): v.item() for k, v in zip(vocab, outputs)}
-                
-                mapped_class = class_map.get(pred_class, 'bad data')
-                
+            if len(day_df) < 12:
                 results.append({
-                    'date': pd.Timestamp(date), 
-                    'raw_class': mapped_class, 
-                    'prob': outputs[pred_idx].item(),
-                    'prob_NPF': all_probs.get('NPF', 0.0),
-                    'prob_NonNPF': all_probs.get('NO', 0.0),
-                    'prob_Bad': all_probs.get('BAD', 0.0)
+                    'date': pd.Timestamp(date), 'raw_class': 'bad data', 
+                    'prob': 1.0, 'prob_NPF': 0.0, 'prob_NonNPF': 0.0, 'prob_Bad': 1.0
                 })
-                    
-            self.progress.emit(100, "Classification complete.")
-            res_df = pd.DataFrame(results).set_index('date')
-            self.finished.emit(res_df)
+                continue
             
-        except Exception as exc:
-            self.error.emit(str(exc))
+            date_str = pd.Timestamp(date).strftime('%Y-%m-%d')                
+            img_name = f"{self.file_name}_{date_str}.png"                    
+            img_path = os.path.join(debug_dir, img_name)                     
+            
+            self._generate_temp_plot(day_df, img_path)                       
+            
+            pred_class, pred_idx, outputs = learner.predict(img_path)        
+            vocab = list(learner.dls.vocab)
+            all_probs = {str(k): v.item() for k, v in zip(vocab, outputs)}
+            
+            mapped_class = class_map.get(pred_class, 'bad data')
+            
+            results.append({
+                'date': pd.Timestamp(date), 
+                'raw_class': mapped_class, 
+                'prob': outputs[pred_idx].item(),
+                'prob_NPF': all_probs.get('NPF', 0.0),
+                'prob_NonNPF': all_probs.get('NO', 0.0),
+                'prob_Bad': all_probs.get('BAD', 0.0)
+            })
+                
+        res_df = pd.DataFrame(results).set_index('date')
+        return res_df
 
     def _generate_temp_plot(self, day_df, save_path):
         import matplotlib as mpl
@@ -208,7 +219,7 @@ class MLSummaryWindow(QDialog):
     def __init__(self, raw_df, diams, results_df, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Deep Learning Classification Summary")
-        self.resize(1100, 700)
+        fit_to_screen(self, 1100, 700)
         self.raw_df = raw_df
         self.diams = diams
         self.results = results_df
@@ -250,8 +261,7 @@ class MLSummaryWindow(QDialog):
         ax_freq.legend(loc='upper right')
         ax_freq.set_title("Classification Frequency Over Time", fontweight='bold')
         
-        log_d = np.log10(self.diams)
-        dlogdp = np.mean(np.diff(log_d)) if len(log_d) > 1 else 0.1
+        dlogdp = dlogdp_per_bin(self.diams)
         
         classes = ['NPF', 'non-NPF', 'bad data']
         for i, cls in enumerate(classes):
@@ -271,7 +281,7 @@ class MLSummaryWindow(QDialog):
             if i == 0: ax_cont.set_ylabel("Dp (nm)")
             
             ax_dn = ax_cont.twinx()
-            total_n = diurnal.sum(axis=1) * dlogdp
+            total_n = (diurnal * dlogdp).sum(axis=1)
             ax_dn.plot(diurnal.index, total_n, color='white', lw=2.5, alpha=0.9, label='Total N')
             if i == 2: ax_dn.set_ylabel(r"Total N $(cm^{-3})$", color='black')
             else: ax_dn.set_yticklabels([])
@@ -286,7 +296,7 @@ class DiurnalSummaryWindow(QDialog):
     def __init__(self, raw_df, diams, ml_results, j_min, j_max, dlogdp, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Average Diurnals (NPF vs Non-NPF)")             
-        self.resize(1000, 900)                                               
+        fit_to_screen(self, 1000, 900)                                               
         self.raw_df = raw_df
         self.diams = diams
         self.ml_results = ml_results
@@ -325,7 +335,8 @@ class DiurnalSummaryWindow(QDialog):
             
             cs_series = calc_condensation_sink(self.diams, diurnal_pnsd, self.dlogdp)
             coags_matrix = calc_coagulation_sink(self.diams, diurnal_pnsd, self.dlogdp)
-            j_tot, _, _, _ = calc_formation_rate(self.diams, diurnal_pnsd, self.dlogdp, assumed_gr, self.j_min, self.j_max, coags_matrix)
+            j_tot, _, _, _ = calc_formation_rate(self.diams, diurnal_pnsd, self.dlogdp, assumed_gr,
+                                                 self.j_min, self.j_max, coags_matrix, 3600.0)
             n_tot, mass_tot = self._calc_mass(diurnal_pnsd)
             
             time_axis = np.arange(1, 24)
@@ -420,7 +431,9 @@ class NPFDeepLearningPanel(QWidget):
 
         import pathlib, platform
         if platform.system() == 'Windows': pathlib.PosixPath = pathlib.WindowsPath
-        self.model_path = os.path.abspath(os.path.join("models", "NPF_CNN_model.pkl"))
+        # Anchored to the package, not the working directory, so the model is
+        # still found when PyNSD is launched from somewhere else.
+        self.model_path = str(Path(__file__).resolve().parent.parent / "models" / "NPF_CNN_model.pkl")
         
         self._build_ui()
 
@@ -442,7 +455,8 @@ class NPFDeepLearningPanel(QWidget):
                 plot_df = pd.concat([self.day_df, next_df]).sort_index()
         return plot_df
 
-    def _update_ascii_art(self, pct, text):
+    def _update_ascii_art(self, done, total, text):
+        pct = int(100 * done / total) if total else 0
         monkey = f"""
          {'_' * (len(text) + 2)}
         < {text} >
@@ -459,7 +473,20 @@ class NPFDeepLearningPanel(QWidget):
         self.ascii_label.setText(monkey)
 
     def _build_ui(self):
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        self._tabs = QTabWidget()
+        outer.addWidget(self._tabs)
+
+        # The automated identifiers get their own tab, above the per-day tools.
+        auto_holder = QWidget()
+        auto_layout = QVBoxLayout(auto_holder)
+        self.auto_section = AutoIdentifierSection(self)
+        auto_layout.addWidget(self.auto_section)
+        self._tabs.addTab(auto_holder, "Run identifiers")
+
+        day_holder = QWidget()
+        self._tabs.addTab(day_holder, "Inspect a day")
+        layout = QVBoxLayout(day_holder)
         
         dl_box = QGroupBox("1. Automated Deep Learning Identifier")
         dl_layout = QHBoxLayout(dl_box)
@@ -529,6 +556,10 @@ class NPFDeepLearningPanel(QWidget):
         self.ascii_label.setStyleSheet("font-family: Courier; font-size: 12px; color: #333; background-color: #eee; padding: 5px;")
         self.ascii_label.setVisible(False)
         layout.addWidget(self.ascii_label)
+
+        self.run_progress = RunProgress()
+        self.run_progress.cancel_requested.connect(self._cancel_classification)
+        layout.addWidget(self.run_progress)
         
         nav_layout = QHBoxLayout()
         self.btn_prev = QPushButton("◄ Previous")
@@ -689,32 +720,72 @@ class NPFDeepLearningPanel(QWidget):
         main_splitter.setStretchFactor(1, 2)                                 
         layout.addWidget(main_splitter, stretch=1)                           
 
+        # Red outline while a box holds something unusable.
+        validate_number(self.val_dlogdp, minimum=0, maximum=2)
+        validate_number(self.j_min_dp, minimum=0)
+        validate_number(self.j_max_dp, minimum=0)
+
+
+
     def load_data(self, data_file):
         self.df = data_file.df
         self.diams = np.array(data_file.diameters)
         self.file_name = os.path.splitext(os.path.basename(data_file.filename))[0] if hasattr(data_file, 'filename') else "Dataset"
         
         log_diams = np.log10(self.diams)
-        default_dlogdp = np.mean(np.diff(log_diams)) if len(log_diams) > 1 else 1.0 
-        self.val_dlogdp.setText(f"{default_dlogdp:.3f}") 
-        if not os.path.exists(self.model_path): QMessageBox.warning(self, "Model Missing", f"Could not find model at:\n{self.model_path}")
+        self.val_dlogdp.setText(f"{float(np.mean(dlogdp_per_bin(self.diams))):.3f}")
+        self._model_warning_shown = False               # a new dataset earns one fresh warning
+
+    def showEvent(self, event):
+        """Warn about a missing model when this tab is opened, not when data loads.
+
+        Confirming a dataset should not interrupt someone who never intends to
+        use the classifier.
+        """
+        super().showEvent(event)
+        if getattr(self, "_model_warning_shown", False) or os.path.exists(self.model_path):
+            return
+        self._model_warning_shown = True
+        # Deferred, so the dialog does not open part-way through showing the tab.
+        QTimer.singleShot(0, lambda: QMessageBox.warning(
+            self, "Model Missing", f"Could not find model at:\n{self.model_path}"))
 
     def _start_classification(self):
         if self.df is None or not os.path.exists(self.model_path): return
         self.run_btn.setEnabled(False)
         self.ascii_label.setVisible(True)
-        self._update_ascii_art(0, "Initialising model...")
+        self._update_ascii_art(0, 1, "Initialising model...")
         thresh = self.thresh_slider.value() / 100.0
-        
-        f_name = getattr(self, 'file_name', 'Dataset')                                                   
-        self.worker = MLClassifierWorker(self.df, self.diams, self.model_path, thresh, f_name)   
-        
+
+        f_name = getattr(self, 'file_name', 'Dataset')
+        self.worker = MLClassifierWorker(self.df, self.diams, self.model_path, thresh, f_name)
+
         self.worker.progress.connect(self._update_ascii_art)
+        self.worker.progress.connect(self.run_progress.update)
         self.worker.finished.connect(self._on_classification_done)
+        self.worker.cancelled.connect(self._on_classification_cancelled)
+        self.worker.error.connect(self._on_classification_error)
+        self.run_progress.start("Classifying days…")
         self.worker.start()
+
+    def _cancel_classification(self):
+        if getattr(self, "worker", None) is not None and self.worker.isRunning():
+            self.worker.cancel()
+
+    def _on_classification_cancelled(self):
+        self.run_progress.stop()
+        self.ascii_label.setVisible(False)
+        self.run_btn.setEnabled(True)
+
+    def _on_classification_error(self, msg):
+        self.run_progress.stop()
+        self.ascii_label.setVisible(False)
+        self.run_btn.setEnabled(True)
+        QMessageBox.warning(self, "Classification failed", msg)
 
     def _on_classification_done(self, results_df):
         self.master_ml_results = results_df
+        self.run_progress.stop()
         self.ascii_label.setVisible(False)
         self.run_btn.setEnabled(True)
         self.btn_export_ml.setEnabled(True)
@@ -763,7 +834,7 @@ class NPFDeepLearningPanel(QWidget):
 
     def _export_ml_results(self):
         if self.master_ml_results.empty: return
-        path, _ = QFileDialog.getSaveFileName(self, "Save Full ML Classification", "", "CSV Files (*.csv)")
+        path, _ = get_save_file_name(self, "Save Full ML Classification", "", "CSV Files (*.csv)")
         if path:
             self.current_ml_results.to_csv(path)
             QMessageBox.information(self, "Export Successful", f"Saved ML classifications to:\n{path}")
@@ -828,8 +899,8 @@ class NPFDeepLearningPanel(QWidget):
             if plot_df.index.min() <= midnight_split <= plot_df.index.max():
                 self.ax_hm.axvline(mdates.date2num(midnight_split), color='black', linestyle='--', linewidth=1.0, alpha=0.7, zorder=5)
         
-        log_d = np.log10(self.diams); dlogdp = np.mean(np.diff(log_d)) if len(log_d) > 1 else 1.0
-        tot_n = np.sum(pnsd_safe, axis=1) * dlogdp
+        dlogdp = resolve_dlogdp(self.diams, self.val_dlogdp.text())
+        tot_n = integrate_pnsd(pnsd_safe, dlogdp)
         self.ax_hm_line.plot(dates, tot_n, color='red', alpha=0.6)
         self.ax_hm_line.set_ylabel("Total N", color='red')
         self.ax_hm_line.yaxis.set_label_position("right")
@@ -1018,8 +1089,9 @@ class NPFDeepLearningPanel(QWidget):
                 if btn.text().startswith("Custom"): btn.setText("Custom")
 
     def auto_calculate_non_npf(self):
-        try: dlogdp = float(self.val_dlogdp.text())
+        try: float(self.val_dlogdp.text())
         except ValueError: return QMessageBox.warning(self, "Error", "dlogDp must be a number.")
+        dlogdp = resolve_dlogdp(self.diams, self.val_dlogdp.text())
         cs_series = calc_condensation_sink(self.diams, self.day_df.to_numpy(), dlogdp)
         self.gr_result = np.nan
         
@@ -1066,8 +1138,9 @@ class NPFDeepLearningPanel(QWidget):
             
         try: 
             j_min = float(self.j_min_dp.text()); j_max = float(self.j_max_dp.text())
-            dlogdp = float(self.val_dlogdp.text())
+            float(self.val_dlogdp.text())
         except ValueError: return QMessageBox.warning(self, "Input Error", "Inputs must be numbers.")
+        dlogdp = resolve_dlogdp(self.diams, self.val_dlogdp.text())
         
         j_window_str = f"{j_min}-{j_max}"
         # Compute over the active window: in 48h mode this spans into the next
@@ -1076,7 +1149,8 @@ class NPFDeepLearningPanel(QWidget):
         pnsd = calc_df.to_numpy()
         cs_series = calc_condensation_sink(self.diams, pnsd, dlogdp)
         coags_matrix = calc_coagulation_sink(self.diams, pnsd, dlogdp)
-        j_total, dN_dt, gr_term, coag_term = calc_formation_rate(self.diams, pnsd, dlogdp, gr_to_use, j_min, j_max, coags_matrix)
+        j_total, dN_dt, gr_term, coag_term = calc_formation_rate(self.diams, pnsd, dlogdp, gr_to_use,
+                                                                 j_min, j_max, coags_matrix, calc_df.index)
         
         m_series = np.full_like(j_total, np.nan)                                 
         j15_series = np.full_like(j_total, np.nan)                               
@@ -1226,7 +1300,7 @@ class NPFDeepLearningPanel(QWidget):
             self.csv_table.setItem(r_idx, 13, QTableWidgetItem(fmt(row['J1.5'], '.3e')))
 
     def _choose_new_csv(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Set CSV Output File", "", "CSV Files (*.csv)")
+        path, _ = get_save_file_name(self, "Set CSV Output File", "", "CSV Files (*.csv)")
         if path:
             self._init_master_csv(path)
 
@@ -1241,7 +1315,7 @@ class NPFDeepLearningPanel(QWidget):
             return
 
         if not self.last_csv_path:
-            path, _ = QFileDialog.getSaveFileName(self, "Choose master CSV file", "", "CSV Files (*.csv)")
+            path, _ = get_save_file_name(self, "Choose master CSV file", "", "CSV Files (*.csv)")
             if not path: return
             if not self._init_master_csv(path): return
 
@@ -1265,8 +1339,9 @@ class NPFDeepLearningPanel(QWidget):
     def _show_diurnals(self):
         try:
             j_min = float(self.j_min_dp.text()); j_max = float(self.j_max_dp.text())
-            dlogdp = float(self.val_dlogdp.text())
+            float(self.val_dlogdp.text())
         except ValueError: return QMessageBox.warning(self, "Error", "Check J bounds and dlogDp.")
+        dlogdp = resolve_dlogdp(self.diams, self.val_dlogdp.text())
         
         if not self.classifications: return QMessageBox.warning(self, "No Data", "Classify at least one day first!") 
         dummy_ml = pd.DataFrame([{'date': pd.to_datetime(d), 'class': c} for d, c in self.classifications.items()]).set_index('date') 
@@ -1276,8 +1351,9 @@ class NPFDeepLearningPanel(QWidget):
 
     def _show_coags_map(self):                                                   
         if self.df is None: return
-        try: dlogdp = float(self.val_dlogdp.text())
+        try: float(self.val_dlogdp.text())
         except ValueError: return QMessageBox.warning(self, "Error", "dlogDp must be a number.")
+        dlogdp = resolve_dlogdp(self.diams, self.val_dlogdp.text())
         self.coags_win = CoagSWindow(self.day_df, self.diams, dlogdp, self)
         self.coags_win.show()
 

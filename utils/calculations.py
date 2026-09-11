@@ -2,6 +2,65 @@ import numpy as np
 from scipy import signal, stats
 import pandas as pd
 
+
+def log_bin_edges(diams_nm: np.ndarray) -> np.ndarray:
+    """Bin edges in log10(Dp), midway between centres and extrapolated at the ends."""
+    log_d = np.log10(np.asarray(diams_nm, dtype=float))
+    if len(log_d) < 2:
+        return np.array([log_d[0] - 0.05, log_d[0] + 0.05])
+
+    edges = np.empty(len(log_d) + 1)
+    edges[1:-1] = (log_d[:-1] + log_d[1:]) / 2.0
+    edges[0] = log_d[0] - (edges[1] - log_d[0])
+    edges[-1] = log_d[-1] + (log_d[-1] - edges[-2])
+    return edges
+
+
+def dlogdp_per_bin(diams_nm: np.ndarray) -> np.ndarray:
+    """Width of every size bin in log10(Dp).
+
+    Integrate the distribution with these, not with one mean width: spliced or
+    variable-resolution data has bins of genuinely different widths, and a single
+    mean biases total number, mass and every sink that sums over the spectrum.
+    """
+    return np.diff(log_bin_edges(diams_nm))
+
+
+def integrate_pnsd(pnsd_dndlogdp, dlogdp) -> np.ndarray:
+    """Total number (cm-3) per row, from dN/dlogDp and per-bin (or uniform) widths."""
+    return np.nansum(np.asarray(pnsd_dndlogdp, dtype=float) * np.asarray(dlogdp, dtype=float), axis=1)
+
+
+def resolve_dlogdp(diams_nm: np.ndarray, typed_text=None) -> np.ndarray:
+    """Per-bin widths, unless the user has typed a different uniform width.
+
+    The panels show the mean width in an editable box.  Leaving it alone means
+    "use the real bin widths"; changing it is an explicit uniform override.
+    """
+    widths = dlogdp_per_bin(diams_nm)
+    if typed_text is None or typed_text == "":
+        return widths
+    try:
+        typed = float(typed_text)
+    except (TypeError, ValueError):
+        return widths
+    if typed <= 0 or np.isclose(typed, float(np.mean(widths)), rtol=5e-3):
+        return widths
+    return np.full(len(widths), typed)
+
+
+def seconds_between(times) -> np.ndarray:
+    """Seconds from each sample to the next, for real (possibly irregular) data.
+
+    Passing a single number treats the series as evenly spaced by that many
+    seconds, which is what the fixed-grid diurnal composites want.
+    """
+    if np.isscalar(times):
+        return np.asarray([float(times)])
+    idx = pd.DatetimeIndex(times)
+    return np.diff(idx.view("int64")) / 1e9
+
+
 def get_coagulation_coef(d_nm: np.ndarray, T: float = 293.15):
     """Calculates the Coagulation Coefficient matrix K (m3/s)."""
     d = d_nm * 1e-9                                                          
@@ -45,23 +104,42 @@ def calc_condensation_sink(diams_nm: np.ndarray, pnsd_dndlogdp: np.ndarray, dlog
     Kn = (2 * 65e-9) / d                                                     
     betaM = (Kn + 1) / (1 + 1.677 * Kn + 1.333 * Kn**2)                      
     
-    Mair, dair, dsulp = 28.965, 19.7, 22.9 + 6.11*4 + 2.31*2                 
-    D = ((0.00143 * T)**1.75) / (P * np.sqrt(Mair) * (dair**(1/3) + dsulp**(1/3))**2) 
-    
-    N_m3 = (pnsd_dndlogdp * dlogdp) * 1e6                                    
-    cs_series = 2 * np.pi * D * np.sum(N_m3 * betaM * d, axis=1)             
-    return cs_series                                                         
+    # Fuller diffusion volumes for the air/H2SO4 pair, and the reduced molar mass.
+    Mair, Msulp = 28.965, 98.079
+    M_AB = 2.0 / (1.0 / Mair + 1.0 / Msulp)
+    dair, dsulp = 19.7, 22.9 + 6.11*4 + 2.31*2
 
-def calc_formation_rate(diams_nm: np.ndarray, pnsd_dndlogdp: np.ndarray, dlogdp: float, 
-                        gr_nm_hr: float, j_min_nm: float, j_max_nm: float, coags_matrix: np.ndarray):
-    """Calculates Formation Rate (J) using the exact bounds and Coagulation Sink matrix."""
+    # Fuller (1966): D[cm2/s] = 0.00143 T^1.75 / (P[bar] sqrt(M_AB) (sv_A^1/3 + sv_B^1/3)^2).
+    # T is raised to 1.75, not (0.00143 T); P is in bar, not kPa.
+    P_bar = P / 100.0
+    D_cm2 = (0.00143 * T**1.75) / (P_bar * np.sqrt(M_AB) * (dair**(1/3) + dsulp**(1/3))**2)
+    D = D_cm2 * 1e-4                                                         # cm2/s -> m2/s
+
+    N_m3 = (pnsd_dndlogdp * dlogdp) * 1e6
+    cs_series = 2 * np.pi * D * np.nansum(N_m3 * betaM * d, axis=1)
+    return cs_series
+
+def calc_formation_rate(diams_nm: np.ndarray, pnsd_dndlogdp: np.ndarray, dlogdp,
+                        gr_nm_hr: float, j_min_nm: float, j_max_nm: float, coags_matrix: np.ndarray,
+                        times):
+    """Calculates Formation Rate (J) using the exact bounds and Coagulation Sink matrix.
+
+    ``times`` is the timestamp index of the rows, or a single number of seconds
+    for evenly spaced data.  dN/dt has to use the real sampling interval: taking
+    it as one hour makes J wrong by the ratio for 15 min or 10 min data.
+    """
     j_mask = (diams_nm >= j_min_nm) & (diams_nm <= j_max_nm)                 # Isolate the J boundary bins
-    
-    N_j = pnsd_dndlogdp[:, j_mask] * dlogdp                                  # Target bins dN
-    Bin_total = np.sum(N_j, axis=1)                                          # Total N in target range per row
-    
-    dN_dt = np.zeros_like(Bin_total)                                         
-    dN_dt[1:] = np.diff(Bin_total) / 3600.0                                  
+
+    widths = np.asarray(dlogdp, dtype=float)
+    widths = widths[j_mask] if widths.ndim else widths                       # per-bin widths, if given
+    N_j = pnsd_dndlogdp[:, j_mask] * widths                                  # Target bins dN
+    Bin_total = np.nansum(N_j, axis=1)                                       # Total N in target range per row
+
+    dt = seconds_between(times)
+    dN_dt = np.zeros_like(Bin_total)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        dN_dt[1:] = np.diff(Bin_total) / dt
+    dN_dt[~np.isfinite(dN_dt)] = 0.0                                         # repeated timestamps, if any
     
     # Calculate row-by-row weighted mean CoagS for the target bins
     weights = np.zeros_like(N_j)
@@ -75,9 +153,6 @@ def calc_formation_rate(diams_nm: np.ndarray, pnsd_dndlogdp: np.ndarray, dlogdp:
     
     j_total = dN_dt + coag_term + gr_term                                    
     return j_total, dN_dt, gr_term, coag_term
-
-from scipy import signal, stats
-import numpy as np
 
 # ----------------------------------------------------------------------------------------------- #
 # Use this to estimate J1.5 from Jx :)
@@ -146,32 +221,3 @@ def calc_growth_rate(time_hours: np.ndarray, mode_diams: np.ndarray):
     """Calculates GR (nm/hr) using simple linear regression."""
     res = stats.linregress(time_hours, mode_diams)                                   # Perform linear fit
     return res.slope, res.intercept                                                  # Return slope and intercept
-
-
-def resample_wind_data(wind_df: pd.DataFrame, target_index: pd.DatetimeIndex, ws_col: str, wd_col: str):
-    """Resamples high-resolution WS/WD data to match PNSD timestamps using true vector averaging."""
-    wd_rad = np.radians(wind_df[wd_col])                                     # Convert degrees to radians
-    
-    wind_df['u'] = -wind_df[ws_col] * np.sin(wd_rad)                         # East-West (u) vector component
-    wind_df['v'] = -wind_df[ws_col] * np.cos(wd_rad)                         # North-South (v) vector component
-    
-    freq = pd.infer_freq(target_index) or '1H'                               # Infer PNSD resolution (usually 1H)
-    resampled = wind_df[['u', 'v']].resample(freq).mean()                    # Average the raw vectors
-    
-    res_ws = np.sqrt(resampled['u']**2 + resampled['v']**2)                  # Reconstruct true wind speed
-    res_wd = (np.degrees(np.arctan2(-resampled['u'], -resampled['v'])) + 360) % 360 # Reconstruct true wind direction
-    
-    final_df = pd.DataFrame({'WS': res_ws, 'WD': res_wd}, index=resampled.index) # Create clean dataframe
-    return final_df.reindex(target_index, method='nearest', tolerance=pd.Timedelta(freq)) # Snap exactly to PNSD timestamps
-
-def assign_wind_sectors(df: pd.DataFrame, sectors: list):
-    """Assigns data to wind sectors, safely handling the 360-0 degree wrap-around."""
-    df['Sector'] = 'Unclassified'                                            # Default state
-    for sec in sectors:                                                      # Loop through user-defined limits
-        name, s_min, s_max = sec['name'], float(sec['min']), float(sec['max']) 
-        if s_min > s_max:                                                    # Handle North wrap-around (e.g., 330 to 30)
-            mask = (df['WD'] >= s_min) | (df['WD'] <= s_max)                 # Use OR operator
-        else:                                                                # Standard slice
-            mask = (df['WD'] >= s_min) & (df['WD'] <= s_max)                 # Use AND operator
-        df.loc[mask, 'Sector'] = name                                        # Assign name to matching rows
-    return df                                                                # Return updated dataframe

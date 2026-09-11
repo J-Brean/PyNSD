@@ -8,12 +8,13 @@ from PyQt6.QtCore import Qt                                                  # C
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg              # Canvas
 from matplotlib.figure import Figure                                         # Plot figure
 from utils.data_loader import regrid_pnsd_cdf, DataFile                      # Import spline tool
+from utils.helpers import fit_to_screen
 
 class InstrumentMergerDialog(QDialog):
     def __init__(self, file1: DataFile, file2: DataFile, parent=None):       
         super().__init__(parent)
         self.setWindowTitle("Advanced Instrument Merger")                    
-        self.resize(900, 700)                                                
+        fit_to_screen(self, 900, 700)                                                
         
         df1_aligned, df2_aligned = file1.df.align(file2.df, join='inner', axis=0) # Sync timebases
         if df1_aligned.empty:                                                
@@ -28,8 +29,15 @@ class InstrumentMergerDialog(QDialog):
         self.diams1 = np.array(file1.diameters)                              
         self.diams2 = np.array(file2.diameters)                              
         
-        self.all_diams = np.unique(np.concatenate([self.diams1, self.diams2])) 
-        self.all_diams.sort()                                                
+        self.all_diams = np.unique(np.concatenate([self.diams1, self.diams2]))
+        self.all_diams.sort()
+
+        # The sliders only rescale these, so compute them once rather than
+        # re-reducing both full frames on every slider tick.
+        self._mean1 = self.df1.mean(axis=0).to_numpy()
+        self._std1 = self.df1.std(axis=0).to_numpy()
+        self._mean2 = self.df2.mean(axis=0).to_numpy()
+        self._std2 = self.df2.std(axis=0).to_numpy()
         
         self.final_df = None                                                 
         self.final_diams = None                                              
@@ -99,7 +107,7 @@ class InstrumentMergerDialog(QDialog):
         opt_layout.addWidget(QLabel("Channels/Decade:"))                     
         self.val_cpd = QLineEdit("64")                                       
         self.val_cpd.setFixedWidth(40)                                       
-        self.val_cpd.textChanged.connect(self._update_plot)                  
+        self.val_cpd.editingFinished.connect(self._update_plot)                  
         opt_layout.addWidget(self.val_cpd)                                   
         opt_layout.addStretch()                                              
         layout.addLayout(opt_layout)                                         
@@ -130,11 +138,9 @@ class InstrumentMergerDialog(QDialog):
         
         self.ax.clear()                                                      
         
-        # Calculate Means AND Standard Deviations
-        mean1 = self.df1.mean(axis=0).to_numpy() * f1
-        std1 = self.df1.std(axis=0).to_numpy() * f1
-        mean2 = self.df2.mean(axis=0).to_numpy() * f2
-        std2 = self.df2.std(axis=0).to_numpy() * f2
+        # Scale the cached means and standard deviations
+        mean1, std1 = self._mean1 * f1, self._std1 * f1
+        mean2, std2 = self._mean2 * f2, self._std2 * f2
         
         is_order_1_low = self.combo_order.currentIndex() == 0                
         keep1_mask = self.diams1 <= merge_dp if is_order_1_low else self.diams1 > merge_dp

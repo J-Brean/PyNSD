@@ -7,23 +7,24 @@ import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 
-from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QComboBox,
-    QFileDialog, QGroupBox, QMessageBox, QCheckBox, QDialog
-)
-from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import (QWidget,
+                             QVBoxLayout,
+                             QHBoxLayout,
+                             QLabel,
+                             QPushButton,
+                             QLineEdit,
+                             QComboBox,
+                             QGroupBox,
+                             QMessageBox,
+                             QCheckBox,
+                             QDialog)
 
-from utils.data_loader import DATE_COLUMN_OPTIONS, DATE_FORMAT_OPTIONS, fmt_to_strptime
+from utils.data_loader import DATE_COLUMN_OPTIONS, DATE_FORMAT_OPTIONS, parse_datetime_series
+from utils.helpers import fit_to_screen
+from utils.calculations import dlogdp_per_bin, integrate_pnsd
+from gui.widgets import validate_number
+from gui.filedialogs import get_open_file_name, get_save_file_name
 
-
-def _strip_time_tokens(token_fmt: str) -> str:
-    if not token_fmt:
-        return token_fmt
-    fmt = token_fmt.strip()
-    for suffix in (" HH:mm:ss", " HH:mm", "THH:mm:ss", "THH:mm"):
-        if fmt.endswith(suffix):
-            return fmt[: -len(suffix)].strip()
-    return fmt
 
 
 class ExportDialog(QDialog):
@@ -58,7 +59,7 @@ class ExportDialog(QDialog):
 
         w = int(fig.get_figwidth() * fig.dpi)
         h = int(fig.get_figheight() * fig.dpi) + 50
-        self.resize(w, h)
+        fit_to_screen(self, w, h)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -68,12 +69,12 @@ class ExportDialog(QDialog):
     def apply_size(self):
         try:
             w, h = int(self.val_w.text()), int(self.val_h.text())
-            self.resize(w, h + 50)
+            fit_to_screen(self, w, h + 50)
         except ValueError:
             pass
 
     def save_plot(self):
-        path, _ = QFileDialog.getSaveFileName(
+        path, _ = get_save_file_name(
             self,
             "Save Plot",
             "",
@@ -179,11 +180,7 @@ class WindPanel(QWidget):
 
         row_b.addWidget(QLabel("Format:"))
         self.fmt_combo = QComboBox()
-        sorted_fmts = sorted(
-            DATE_FORMAT_OPTIONS,
-            key=lambda x: 0 if str(x[0]).upper().startswith("Y") else (1 if str(x[0]).upper().startswith("D") else 2),
-        )
-        for disp, _ in sorted_fmts:
+        for disp, _ in DATE_FORMAT_OPTIONS:
             self.fmt_combo.addItem(disp)
         self.fmt_combo.currentIndexChanged.connect(self._on_fmt_changed)
         row_b.addWidget(self.fmt_combo)
@@ -262,6 +259,11 @@ class WindPanel(QWidget):
         self.canvas = FigureCanvasQTAgg(self.fig)
         root.addWidget(self.canvas, stretch=1)
 
+        # Red outline while a box holds something unusable.
+        validate_number(self.avg_val, minimum=1, integer=True)
+
+
+
     def _on_date_col_changed(self, text: str):
         self.custom_date_col.setVisible(text == "Custom...")
 
@@ -271,7 +273,7 @@ class WindPanel(QWidget):
         self.custom_fmt.setVisible(val == "custom")
 
     def _browse_met_file(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select Met File", "", "Data (*.csv *.xlsx *.xls *.txt *.tsv *.dat)")
+        path, _ = get_open_file_name(self, "Select Met File", "", "Data (*.csv *.xlsx *.xls *.txt *.tsv *.dat)")
         if not path:
             return
 
@@ -346,19 +348,7 @@ class WindPanel(QWidget):
         fmt_val = next(v for d, v in DATE_FORMAT_OPTIONS if d == fmt_disp)
         date_fmt = self.custom_fmt.text().strip() if fmt_val == "custom" else fmt_val
 
-        raw_dt = met[dt_col].astype(str).str.strip()
-        parsed = pd.to_datetime(raw_dt, format=fmt_to_strptime(date_fmt), errors="coerce")
-
-        if parsed.isna().any() and ("HH" in str(date_fmt) or "%H" in fmt_to_strptime(date_fmt)):
-            date_only_fmt = _strip_time_tokens(date_fmt)
-            if date_only_fmt != date_fmt:
-                miss = parsed.isna()
-                parsed.loc[miss] = pd.to_datetime(raw_dt[miss], format=fmt_to_strptime(date_only_fmt), errors="coerce")
-
-        if parsed.isna().mean() > 0.2:
-            parsed = pd.to_datetime(raw_dt, errors="coerce", utc=False)
-
-        met[dt_col] = parsed
+        met[dt_col] = parse_datetime_series(met[dt_col], date_fmt)
         met = met.dropna(subset=[dt_col]).copy()
 
         tz = self.tz_input.text().strip() or "UTC"
@@ -384,11 +374,35 @@ class WindPanel(QWidget):
             QMessageBox.warning(self, "WD/WS Columns", "Selected WD/WS columns not found in met data.")
             return
 
+        # A met export with two columns of the same name gives back a frame with
+        # more columns than were asked for, which used to fail with an opaque
+        # length mismatch and no message at all.
+        duplicated = [c for c in (self._wd_col, self._ws_col) if list(met.columns).count(c) > 1]
+        if duplicated:
+            QMessageBox.warning(
+                self, "Repeated column name",
+                f"The met file has more than one column called '{duplicated[0]}'. "
+                "Rename them so each is unique, then load the file again.")
+            return
+
         met = met[[self._wd_col, self._ws_col]].copy()
         met.columns = ["WD", "WS"]
         met["WD"] = pd.to_numeric(met["WD"], errors="coerce")
         met["WS"] = pd.to_numeric(met["WS"], errors="coerce")
-        met = met.dropna(subset=["WD", "WS"])
+
+        usable = met.dropna(subset=["WD", "WS"])
+        if usable.empty:
+            unreadable = "wind direction" if met["WD"].isna().all() else "wind speed"
+            QMessageBox.warning(
+                self, "No usable wind data",
+                f"No row has both a direction and a speed: the {unreadable} column "
+                f"('{self._wd_col if unreadable.startswith('wind d') else self._ws_col}') "
+                "holds no numbers. Check you picked the right columns.")
+            return
+        if len(usable) < len(met):
+            self.status_lbl.setText(f"Dropped {len(met) - len(usable)} met row(s) with no direction or speed.")
+
+        met = usable
         met["WD"] = np.mod(met["WD"], 360.0)
         met["WS"] = np.clip(met["WS"], 0, None)
 
@@ -399,6 +413,11 @@ class WindPanel(QWidget):
             resample_rule = f"{val}min" if unit == "Minutes" else (f"{val}h" if unit == "Hours" else f"{val}D")
         if resample_rule:
             met = self._vector_resample_wind(met, resample_rule)
+            if met.empty:
+                QMessageBox.warning(self, "Averaging emptied the met data",
+                                    f"Averaging to {resample_rule} left no complete intervals. "
+                                    "Try a longer averaging period, or none.")
+                return
 
         self.met_df = met
         self._join_met_with_pnsd()
@@ -431,6 +450,14 @@ class WindPanel(QWidget):
     def _join_met_with_pnsd(self):
         pnsd = self.df.copy()
         met = self.met_df.copy()
+
+        # merge_asof compares the two time columns directly, and on empty frames
+        # their dtypes need not match, which fails with an unreadable message.
+        if met.empty or pnsd.empty:
+            QMessageBox.warning(self, "Nothing to join",
+                                "One of the two datasets is empty after parsing. "
+                                "Check the met file's date column, format and timezone.")
+            return
 
         if pnsd.index.tz is None and met.index.tz is not None:
             pnsd.index = pnsd.index.tz_localize(met.index.tz)
@@ -516,9 +543,8 @@ class WindPanel(QWidget):
         ax_rose = self.fig.add_subplot(121, projection="polar")
         ax_dist = self.fig.add_subplot(122)
 
-        log_d = np.log10(np.array(self.diams, dtype=float))
-        dlogdp = np.mean(np.diff(log_d)) if len(log_d) > 1 else 1.0
-        total_n = df[diam_cols].to_numpy(dtype=float).sum(axis=1) * dlogdp
+        dlogdp = dlogdp_per_bin(np.array(diam_cols, dtype=float))
+        total_n = integrate_pnsd(df[diam_cols].to_numpy(dtype=float), dlogdp)
         df["_TOTAL_N"] = total_n
 
         colors = plt.cm.tab10(np.linspace(0, 1, max(1, len(sectors))))
@@ -671,7 +697,7 @@ class WindPanel(QWidget):
         if not self._ensure_sector_products():
             return
 
-        base, _ = QFileDialog.getSaveFileName(self, "Export Wind Data (Base Name)", "wind_analysis", "CSV (*.csv)")
+        base, _ = get_save_file_name(self, "Export Wind Data (Base Name)", "wind_analysis", "CSV (*.csv)")
         if not base:
             return
         base_path = Path(base)
